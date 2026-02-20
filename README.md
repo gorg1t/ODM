@@ -20,8 +20,8 @@
 
 ```bash
 # 1. Клонировать репозиторий
-git clone <repo-url>
-cd onvif-ptz-controller
+git clone https://github.com/gorg1t/ODM.git
+cd ODM
 
 # 2. Создать виртуальное окружение
 python -m venv venv
