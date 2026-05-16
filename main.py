@@ -1,3 +1,8 @@
+"""
+ONVIF PTZ Controller — PoC
+Entry point for the application.
+"""
+
 import sys
 import logging
 from PyQt6.QtWidgets import QApplication
