@@ -23,10 +23,16 @@ from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QFormLayout, QMenu, QCheckBox, QToolButton,
     QStyle, QFileDialog,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSlot, pyqtSignal, QSize, QUrl, QStandardPaths, QEvent, QPoint, QMimeData
-from PyQt6.QtGui import QImage, QPixmap, QIcon, QKeySequence, QShortcut, QAction, QFont, QColor, QDrag
-from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PyQt6.QtCore import Qt, QTimer, pyqtSlot, pyqtSignal, QSize, QStandardPaths, QEvent, QPoint, QMimeData, QIODevice
+from PyQt6.QtGui import QImage, QPixmap, QIcon, QKeySequence, QShortcut, QAction, QColor, QDrag
+from PyQt6.QtMultimedia import QAudioSink, QAudioFormat, QAudio
 
+from camera_discovery import (
+    DiscoveredCameraInfo,
+    default_discovery_targets,
+    discover_onvif_cameras,
+    parse_discovery_targets,
+)
 from onvif_client import (
     ONVIFPTZClient,
     ImagingSettingsPayload,
@@ -38,7 +44,7 @@ from onvif_client import (
     VideoEncoderSettings,
     VideoResolutionOption,
 )
-from video_player import VideoStreamThread
+from video_player import VideoStreamThread, AUDIO_OUTPUT_SAMPLE_RATE, AUDIO_OUTPUT_CHANNELS
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +74,7 @@ class CameraSession:
     current_stream_uri: Optional[str] = None
     video_thread: Optional[VideoStreamThread] = None
     last_status: PTZStatus = field(default_factory=PTZStatus)
+    audio_volume: float = 0.0
 
 
 @dataclass
@@ -83,6 +90,89 @@ class SavedCameraConfig:
     @property
     def camera_id(self) -> str:
         return f"{self.host}:{self.port}:{self.username}"
+
+
+class VolumeButtonWidget(QWidget):
+    """Compact speaker button that shows a vertical slider popup on click."""
+
+    volume_changed = pyqtSignal(float)
+    _BTN = 26
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self._BTN, self._BTN)
+        self._volume = 0.0
+
+        self._btn = QToolButton(self)
+        self._btn.setFixedSize(self._BTN, self._BTN)
+        self._btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn.setAutoRaise(True)
+        self._btn.setStyleSheet("""
+            QToolButton {
+                background-color: rgba(20,20,20,0.82);
+                border: 1px solid #444;
+                border-radius: 4px;
+                padding: 2px;
+            }
+            QToolButton:hover { background-color: rgba(55,55,55,0.95); border-color: #3794ff; }
+        """)
+        self._btn.clicked.connect(self._toggle_popup)
+
+        self._popup = QFrame(None,
+            Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self._popup.setFixedSize(32, 110)
+        self._popup.setStyleSheet("""
+            QFrame { background:#1e1e1e; border:1px solid #3c3c3c; border-radius:6px; }
+            QSlider::groove:vertical { background:#3c3c3c; width:4px; border-radius:2px; }
+            QSlider::handle:vertical { background:#3794ff; width:12px; height:12px;
+                                       margin:-4px; border-radius:6px; }
+            QSlider::sub-page:vertical { background:#3794ff; border-radius:2px; }
+        """)
+        pl = QVBoxLayout(self._popup)
+        pl.setContentsMargins(4, 6, 4, 6)
+        self._slider = QSlider(Qt.Orientation.Vertical)
+        self._slider.setRange(0, 100)
+        self._slider.setValue(0)
+        self._slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._slider.valueChanged.connect(self._on_slider)
+        pl.addWidget(self._slider)
+
+        self._update_icon()
+
+    def set_volume(self, v: float):
+        self._volume = max(0.0, min(1.0, v))
+        self._slider.blockSignals(True)
+        self._slider.setValue(round(self._volume * 100))
+        self._slider.blockSignals(False)
+        self._update_icon()
+
+    def get_volume(self) -> float:
+        return self._volume
+
+    def _toggle_popup(self):
+        if self._popup.isVisible():
+            self._popup.hide()
+        else:
+            pos = self._btn.mapToGlobal(QPoint(
+                (self._BTN - self._popup.width()) // 2, -self._popup.height() - 4
+            ))
+            self._popup.move(pos)
+            self._popup.show()
+
+    def _on_slider(self, value: int):
+        self._volume = value / 100.0
+        self._update_icon()
+        self.volume_changed.emit(self._volume)
+
+    def _update_icon(self):
+        sp = (QStyle.StandardPixmap.SP_MediaVolumeMuted
+              if self._volume == 0.0
+              else QStyle.StandardPixmap.SP_MediaVolume)
+        self._btn.setIcon(self.style().standardIcon(sp))
+
+    def hideEvent(self, event):
+        self._popup.hide()
+        super().hideEvent(event)
 
 
 class VideoWidget(QLabel):
@@ -103,6 +193,15 @@ class VideoWidget(QLabel):
                 border-radius: 6px;
             }
         """)
+        self.volume_btn = VolumeButtonWidget(self)
+        self.volume_btn.hide()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        bw = self.volume_btn.width()
+        bh = self.volume_btn.height()
+        self.volume_btn.move(self.width() - bw - 8, self.height() - bh - 8)
+        self.volume_btn.raise_()
 
     @pyqtSlot(QImage)
     def update_frame(self, image: QImage):
@@ -194,6 +293,10 @@ class CameraMatrixTile(QFrame):
         self.video_widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         layout.addWidget(self.video_widget, 1)
 
+        # Volume button as direct child of tile (outside WA_TransparentForMouseEvents area)
+        self.volume_btn = VolumeButtonWidget(self)
+        self.volume_btn.hide()
+
         self.title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.video_widget.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.set_preview_size(320, 180)
@@ -204,6 +307,9 @@ class CameraMatrixTile(QFrame):
     def set_selected(self, selected: bool):
         self.setProperty("selected", selected)
         self.close_button.setVisible(selected)
+        self.volume_btn.setVisible(selected)
+        if selected:
+            self.volume_btn.raise_()
         self.style().unpolish(self)
         self.style().polish(self)
         self.update()
@@ -213,6 +319,10 @@ class CameraMatrixTile(QFrame):
         height = max(90, height)
         self.video_widget.setFixedSize(width, height)
         self.setFixedSize(width + 20, height + 62)
+        # Position volume_btn at bottom-right of the video area
+        # video_widget starts at x=10, y=52 (10 margin + 34 header + 8 spacing)
+        bsize = VolumeButtonWidget._BTN
+        self.volume_btn.move(10 + width - bsize - 6, 52 + height - bsize - 6)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -746,12 +856,15 @@ class AddCameraDialog(QDialog):
         *,
         dialog_title: str = "Add Camera",
         confirm_text: str = "Add Camera",
+        allow_local_search: bool = True,
     ):
         super().__init__(parent)
         self.setWindowTitle(dialog_title)
         self.setModal(True)
         self.setMinimumWidth(420)
         self._confirm_text = confirm_text
+        self._allow_local_search = allow_local_search
+        self._discovered_configs: list[SavedCameraConfig] = []
         self._initial = initial or SavedCameraConfig(
             host="172.18.212.18",
             port=80,
@@ -796,6 +909,14 @@ class AddCameraDialog(QDialog):
 
         layout.addLayout(form)
 
+        if self._allow_local_search:
+            actions_row = QHBoxLayout()
+            actions_row.addStretch(1)
+            self.local_search_button = QPushButton("Local Search")
+            self.local_search_button.clicked.connect(self._open_local_search)
+            actions_row.addWidget(self.local_search_button)
+            layout.addLayout(actions_row)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
         )
@@ -805,9 +926,27 @@ class AddCameraDialog(QDialog):
         layout.addWidget(buttons)
 
     def _accept(self):
+        self._discovered_configs = []
         if not self.host_input.text().strip():
             QMessageBox.warning(self, "Validation Error", "Host is required.")
             return
+        self.accept()
+
+    def _open_local_search(self):
+        dialog = LocalSearchDialog(self.camera_config(), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        configs = dialog.camera_configs()
+        if not configs:
+            return
+
+        self._discovered_configs = configs
+        first_config = configs[0]
+        self.host_input.setText(first_config.host)
+        self.port_input.setValue(first_config.port)
+        self.user_input.setText(first_config.username)
+        self.pass_input.setText(first_config.password)
         self.accept()
 
     def camera_config(self) -> SavedCameraConfig:
@@ -817,6 +956,317 @@ class AddCameraDialog(QDialog):
             username=self.user_input.text().strip(),
             password=self.pass_input.text(),
         )
+
+    def camera_configs(self) -> list[SavedCameraConfig]:
+        if self._discovered_configs:
+            return list(self._discovered_configs)
+        return [self.camera_config()]
+
+
+class CameraCredentialsDialog(QDialog):
+    """Prompts for credentials when a discovered camera requires authentication."""
+
+    def __init__(
+        self,
+        initial: Optional[SavedCameraConfig] = None,
+        parent=None,
+        *,
+        dialog_title: str = "Camera Credentials",
+        intro_text: str = "Enter camera credentials.",
+        confirm_text: str = "Save Camera",
+    ):
+        super().__init__(parent)
+        self.setWindowTitle(dialog_title)
+        self.setModal(True)
+        self.setMinimumWidth(420)
+        self._initial = initial or SavedCameraConfig(host="", port=80, username="", password="")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+
+        intro = QLabel(intro_text)
+        intro.setWordWrap(True)
+        intro.setObjectName("dialogHint")
+        layout.addWidget(intro)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(10)
+
+        self.user_input = QLineEdit(self._initial.username)
+        form.addRow("User", self.user_input)
+
+        self.pass_input = QLineEdit(self._initial.password)
+        self.pass_input.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow("Password", self.pass_input)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(confirm_text)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def credentials(self) -> tuple[str, str]:
+        return self.user_input.text().strip(), self.pass_input.text()
+
+
+class LocalSearchDialog(QDialog):
+    """Searches the local network for ONVIF cameras."""
+
+    def __init__(
+        self,
+        initial: Optional[SavedCameraConfig] = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Local Camera Search")
+        self.setModal(True)
+        self.setMinimumSize(640, 420)
+        self._initial = initial or SavedCameraConfig(host="", port=80, username="", password="")
+        self._camera_map: dict[str, DiscoveredCameraInfo] = {}
+        self._selected_configs: list[SavedCameraConfig] = []
+        self._init_ui()
+        QTimer.singleShot(0, self._refresh_search)
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+
+        intro = QLabel(
+            "Searches the current local subnet for ONVIF cameras. Double-click a result to save it. If you enter a filter, the search switches to the specified IPs or subnet."
+        )
+        intro.setWordWrap(True)
+        intro.setObjectName("dialogHint")
+        layout.addWidget(intro)
+
+        targets_form = QFormLayout()
+        targets_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        targets_form.setHorizontalSpacing(12)
+        targets_form.setVerticalSpacing(8)
+
+        self.targets_input = QLineEdit()
+        self.targets_input.setPlaceholderText("172.18, 172.18.212.18 or 192.168.1.0/24")
+        self.targets_input.returnPressed.connect(self._refresh_search)
+        targets_form.addRow("Targets", self.targets_input)
+        layout.addLayout(targets_form)
+
+        self.status_label = QLabel("Preparing local search...")
+        self.status_label.setObjectName("sectionHint")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        self.cameras_list = QListWidget()
+        self.cameras_list.itemChanged.connect(self._on_camera_item_changed)
+        self.cameras_list.itemDoubleClicked.connect(self._on_item_double_clicked)
+        layout.addWidget(self.cameras_list)
+
+        hint = QLabel(
+            "Check the cameras you want to save, then click Add Selected to apply one login and password to all of them."
+        )
+        hint.setObjectName("sectionHint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        actions_row = QHBoxLayout()
+        self.refresh_button = QPushButton("Refresh Search")
+        self.refresh_button.clicked.connect(self._refresh_search)
+        actions_row.addWidget(self.refresh_button)
+
+        self.select_all_button = QPushButton("Select All")
+        self.select_all_button.setEnabled(False)
+        self.select_all_button.clicked.connect(self._select_all_cameras)
+        actions_row.addWidget(self.select_all_button)
+
+        actions_row.addStretch(1)
+
+        self.add_selected_button = QPushButton("Add Selected")
+        self.add_selected_button.setEnabled(False)
+        self.add_selected_button.clicked.connect(self._add_selected_cameras)
+        actions_row.addWidget(self.add_selected_button)
+        layout.addLayout(actions_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _refresh_search(self):
+        self.cameras_list.clear()
+        self.cameras_list.setEnabled(False)
+        self._camera_map = {}
+        self._selected_configs = []
+        self.add_selected_button.setEnabled(False)
+        self.select_all_button.setEnabled(False)
+        self.refresh_button.setEnabled(False)
+
+        raw_targets = self.targets_input.text().strip()
+        target_networks: list[str] = []
+
+        try:
+            if raw_targets:
+                targets = parse_discovery_targets(raw_targets)
+            else:
+                targets, target_networks = default_discovery_targets(self._initial.host)
+        except ValueError as e:
+            self.refresh_button.setEnabled(True)
+            QMessageBox.warning(self, "Local Search", str(e))
+            self.status_label.setText(
+                "Enter a valid target IP, dotted prefix, hostname, or CIDR range."
+            )
+            return
+
+        if raw_targets and targets:
+            self.status_label.setText(
+                f"Searching {len(targets)} target(s) for ONVIF cameras..."
+            )
+        elif target_networks:
+            networks_text = ", ".join(target_networks[:2])
+            if len(target_networks) > 2:
+                networks_text = f"{networks_text} ..."
+            self.status_label.setText(
+                f"Searching local subnet(s): {networks_text}"
+            )
+        else:
+            self.status_label.setText("Searching local network for ONVIF cameras...")
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()
+        try:
+            discovered_cameras = discover_onvif_cameras(targets=targets)
+        except ValueError as e:
+            QMessageBox.warning(self, "Local Search", str(e))
+            self.status_label.setText(
+                "Enter a valid target IP, dotted prefix, hostname, or CIDR range."
+            )
+            discovered_cameras = []
+        except Exception as e:
+            logger.error(f"Local camera discovery failed: {e}")
+            QMessageBox.warning(self, "Local Search", f"Camera search failed: {e}")
+            discovered_cameras = []
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        self.refresh_button.setEnabled(True)
+        self._populate_results(discovered_cameras)
+
+    def _populate_results(self, cameras: list[DiscoveredCameraInfo]):
+        self.cameras_list.clear()
+        self._camera_map = {camera.camera_id: camera for camera in cameras}
+        self._selected_configs = []
+
+        if not cameras:
+            self.status_label.setText("No ONVIF cameras were found on the local network.")
+            return
+
+        for camera in cameras:
+            title = camera.name or camera.hardware or camera.host
+            details = f"{camera.host}:{camera.port}"
+            if camera.hardware and camera.hardware != title:
+                details = f"{details}   {camera.hardware}"
+            if camera.location:
+                details = f"{details}   {camera.location}"
+
+            item = QListWidgetItem(f"{title}\n{details}")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            item.setData(Qt.ItemDataRole.UserRole, camera.camera_id)
+            item.setToolTip(self._tooltip_for_camera(camera))
+            self.cameras_list.addItem(item)
+
+        self.cameras_list.setEnabled(True)
+        self.select_all_button.setEnabled(True)
+        self.status_label.setText(f"Found {len(cameras)} ONVIF camera(s).")
+        self._update_add_button()
+
+    def _tooltip_for_camera(self, camera: DiscoveredCameraInfo) -> str:
+        lines = [f"Address: {camera.host}:{camera.port}", f"Service: {camera.xaddr}"]
+        if camera.name:
+            lines.append(f"Name: {camera.name}")
+        if camera.hardware:
+            lines.append(f"Hardware: {camera.hardware}")
+        if camera.location:
+            lines.append(f"Location: {camera.location}")
+        if camera.types:
+            lines.append(f"Types: {' '.join(camera.types)}")
+        return "\n".join(lines)
+
+    def _checked_cameras(self) -> list[DiscoveredCameraInfo]:
+        checked_cameras: list[DiscoveredCameraInfo] = []
+        for index in range(self.cameras_list.count()):
+            item = self.cameras_list.item(index)
+            if item is None or item.checkState() != Qt.CheckState.Checked:
+                continue
+            camera_id = item.data(Qt.ItemDataRole.UserRole)
+            camera = self._camera_map.get(str(camera_id)) if camera_id else None
+            if camera is not None:
+                checked_cameras.append(camera)
+        return checked_cameras
+
+    def _on_camera_item_changed(self, _item: QListWidgetItem):
+        self._update_add_button()
+
+    def _update_add_button(self):
+        self.add_selected_button.setEnabled(bool(self._checked_cameras()))
+
+    def _on_item_double_clicked(self, item: QListWidgetItem):
+        next_state = (
+            Qt.CheckState.Unchecked
+            if item.checkState() == Qt.CheckState.Checked
+            else Qt.CheckState.Checked
+        )
+        item.setCheckState(next_state)
+
+    def _select_all_cameras(self):
+        for index in range(self.cameras_list.count()):
+            item = self.cameras_list.item(index)
+            if item is not None:
+                item.setCheckState(Qt.CheckState.Checked)
+
+    def _add_selected_cameras(self):
+        cameras = self._checked_cameras()
+        if not cameras:
+            return
+
+        camera_count = len(cameras)
+        credentials_dialog = CameraCredentialsDialog(
+            self._initial,
+            self,
+            dialog_title="Camera Credentials",
+            intro_text=(
+                f"Enter credentials to apply to {camera_count} selected camera(s). "
+                "Leave the fields empty if the cameras allow anonymous access."
+            ),
+            confirm_text="Add Cameras",
+        )
+        if credentials_dialog.exec() != QDialog.DialogCode.Accepted:
+            self.status_label.setText("Camera search is ready. Select cameras to add them.")
+            return
+
+        username, password = credentials_dialog.credentials()
+        self._selected_configs = [
+            SavedCameraConfig(
+                host=camera.host,
+                port=camera.port,
+                username=username,
+                password=password,
+            )
+            for camera in cameras
+        ]
+        self.accept()
+
+    def camera_configs(self) -> list[SavedCameraConfig]:
+        return list(self._selected_configs)
+
+    def camera_config(self) -> SavedCameraConfig:
+        if not self._selected_configs:
+            raise RuntimeError("No discovered camera has been selected.")
+        return self._selected_configs[0]
 
 
 class SavedCamerasWidget(QGroupBox):
@@ -1961,9 +2411,6 @@ class MediaProfilesWidget(QGroupBox):
             item.setToolTip(f"Token: {profile.token}")
             if profile.token == session.active_stream_token:
                 active_count += 1
-                active_font = QFont(item.font())
-                active_font.setBold(True)
-                item.setFont(active_font)
                 item.setBackground(QColor("#1f3553"))
                 item.setForeground(QColor("#ffffff"))
             self.profile_list.addItem(item)
@@ -2420,9 +2867,15 @@ class MainWindow(QMainWindow):
             ),
         )
 
-        # Audio playback via QtMultimedia
-        self._audio_output: Optional[QAudioOutput] = None
-        self._audio_player: Optional[QMediaPlayer] = None
+        # Audio playback via QAudioSink (PCM from VideoStreamThread)
+        self._audio_sink: Optional[QAudioSink] = None
+        self._audio_io: Optional[QIODevice] = None
+        # Continuous PCM byte buffer; _flush_audio drains it into the sink.
+        # Using a bytearray avoids truncating chunks at chunk boundaries.
+        self._audio_buf: bytearray = bytearray()
+        self._audio_timer = QTimer()
+        self._audio_timer.setInterval(10)
+        self._audio_timer.timeout.connect(self._flush_audio)
 
         # Status polling timer
         self._status_timer = QTimer()
@@ -2839,7 +3292,6 @@ class MainWindow(QMainWindow):
             QMainWindow, QWidget {
                 background-color: #1e1e1e;
                 color: #cccccc;
-                font-family: 'Segoe UI', sans-serif;
             }
             QGroupBox {
                 border: 1px solid #2d2d30;
@@ -2878,6 +3330,7 @@ class MainWindow(QMainWindow):
             }
             QLabel#statusRtspLabel {
                 font-family: 'Consolas', 'Cascadia Code', monospace;
+                font-size: 12px;
                 color: #ffffff;
                 padding: 0 8px;
             }
@@ -2963,6 +3416,7 @@ class MainWindow(QMainWindow):
                 border-radius: 11px;
                 padding: 6px 10px;
                 color: #d6d6d6;
+                font-size: 13px;
                 font-weight: 600;
             }
             QLabel#sectionTitle {
@@ -2995,6 +3449,7 @@ class MainWindow(QMainWindow):
                 background-color: #0e639c;
                 border-color: #1177bb;
                 color: #ffffff;
+                font-size: 13px;
                 font-weight: 700;
             }
             QPushButton#primaryButton:hover {
@@ -3062,6 +3517,7 @@ class MainWindow(QMainWindow):
                 border: 1px solid #3c3c3c;
                 border-radius: 8px;
                 padding: 7px 10px;
+                font-size: 13px;
                 font-weight: 600;
             }
             QPushButton#ptzZoomButton:hover {
@@ -3374,6 +3830,10 @@ class MainWindow(QMainWindow):
         page_layout.setContentsMargins(0, 0, 0, 0)
 
         video_widget = VideoWidget()
+        video_widget.volume_btn.setVisible(True)
+        video_widget.volume_btn.volume_changed.connect(
+            lambda v, cid=camera_id: self._on_camera_volume_changed(cid, v)
+        )
         page_layout.addWidget(video_widget)
         page.setProperty("camera_id", camera_id)
 
@@ -3382,6 +3842,9 @@ class MainWindow(QMainWindow):
         matrix_tile.double_clicked.connect(self._on_matrix_tile_double_clicked)
         matrix_tile.swap_requested.connect(self._on_matrix_tile_swap_requested)
         matrix_tile.remove_requested.connect(self._on_matrix_tile_remove_requested)
+        matrix_tile.volume_btn.volume_changed.connect(
+            lambda v, cid=camera_id: self._on_camera_volume_changed(cid, v)
+        )
 
         active_stream_token = None
         if preferred_stream_token and client.set_active_profile(preferred_stream_token):
@@ -3882,13 +4345,9 @@ class MainWindow(QMainWindow):
                 if session.current_stream_uri:
                     self._set_rtsp_status(session.current_stream_uri)
                     self.live_video_widget.set_stream_uri(session.current_stream_uri)
-                if start_audio and session.current_stream_uri and self._audio_player is None:
-                    auth_url = self._inject_rtsp_credentials(
-                        session.current_stream_uri,
-                        session.username,
-                        session.password,
-                    )
-                    self._start_audio(auth_url)
+                if start_audio and self._audio_sink is None and session.video_thread:
+                    session.video_thread.audio_chunk_ready.connect(self._on_audio_chunk_ready)
+                    self._on_audio_format_ready(AUDIO_OUTPUT_SAMPLE_RATE, AUDIO_OUTPUT_CHANNELS)
             return
 
         self._stop_video_for_session(session, clear_widget=False)
@@ -3932,10 +4391,10 @@ class MainWindow(QMainWindow):
         session.video_thread.error_occurred.connect(
             partial(self._on_stream_error, session.camera_id)
         )
-        session.video_thread.start()
-
         if not background and start_audio:
-            self._start_audio(auth_url)
+            session.video_thread.audio_format_ready.connect(self._on_audio_format_ready)
+            session.video_thread.audio_chunk_ready.connect(self._on_audio_chunk_ready)
+        session.video_thread.start()
 
     def _on_refresh_stream_uri(self):
         session = self._active_session()
@@ -4686,13 +5145,24 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        config = dialog.camera_config()
-        self._add_camera_defaults = config
-        self._remember_camera(config)
-        self.status_bar.showMessage(
-            "Camera saved. Click it in Saved Cameras to open a tab.",
-            4000,
-        )
+        configs = dialog.camera_configs()
+        if not configs:
+            return
+
+        self._add_camera_defaults = configs[0]
+        for config in configs:
+            self._remember_camera(config)
+
+        if len(configs) == 1:
+            self.status_bar.showMessage(
+                "Camera saved. Click it in Saved Cameras to open a tab.",
+                4000,
+            )
+        else:
+            self.status_bar.showMessage(
+                f"{len(configs)} cameras saved. Click any of them in Saved Cameras to open a tab.",
+                5000,
+            )
 
     def _edit_saved_camera_entry(self, camera_id: str):
         config = self._saved_cameras.get(camera_id)
@@ -4704,6 +5174,7 @@ class MainWindow(QMainWindow):
             self,
             dialog_title="Edit Camera",
             confirm_text="Save",
+            allow_local_search=False,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -5013,37 +5484,90 @@ class MainWindow(QMainWindow):
         if active_session is not None:
             self._remove_camera_session(active_session.camera_id, forget_saved=False)
 
-    def _start_audio(self, rtsp_url: str):
-        """Start audio playback from the RTSP stream via QtMultimedia."""
+    def _on_audio_format_ready(self, sample_rate: int, channels: int):
+        """Create QAudioSink once VideoStreamThread reports the audio format."""
         self._stop_audio()
         try:
-            self._audio_output = QAudioOutput()
-            self._audio_output.setVolume(0.7)
-            self._audio_output.setMuted(False)
-            self._audio_player = QMediaPlayer()
-            self._audio_player.setAudioOutput(self._audio_output)
-            self._audio_player.setSource(QUrl(rtsp_url))
-            self._audio_player.play()
-            logger.info("Audio playback started")
+            fmt = QAudioFormat()
+            fmt.setSampleRate(sample_rate)
+            fmt.setChannelCount(channels)
+            fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+            self._audio_sink = QAudioSink(fmt)
+            # ~500 ms hardware buffer gives plenty of headroom against RTSP jitter.
+            # The timer does NOT start here — playback begins only after the
+            # pre-buffer fills (_on_audio_chunk_ready starts the timer).
+            self._audio_sink.setBufferSize(96000)
+            session = self._active_session()
+            initial_volume = session.audio_volume if session else 0.0
+            self._audio_sink.setVolume(initial_volume)
+            self._audio_io = self._audio_sink.start()
+            self._audio_buf = bytearray()
+            logger.info("Audio sink created, pre-buffering…")
         except Exception as e:
             logger.error(f"Audio playback error: {e}")
 
+    # ~170 ms at 48 kHz stereo s16 — wait for this much data before starting
+    _AUDIO_PREBUF = 32768
+    # Trim to this many bytes (~250 ms) when the in-memory buffer exceeds 1 s
+    _AUDIO_BUF_TRIM = 48000
+    _AUDIO_BUF_MAX = 192000  # ~1 s max before trimming
+    # Silence written per tick when _audio_buf is empty (~10 ms) to keep the
+    # sink in ActiveState and avoid the click that occurs on IdleState resume
+    _AUDIO_SILENCE = 1920
+
+    def _on_audio_chunk_ready(self, pcm_bytes: bytes):
+        """Append incoming PCM to the continuous byte buffer."""
+        self._audio_buf.extend(pcm_bytes)
+        if len(self._audio_buf) > self._AUDIO_BUF_MAX:
+            # Align discard position to an 8-byte stereo float32 frame boundary
+            trim = len(self._audio_buf) - self._AUDIO_BUF_TRIM
+            trim -= trim % 4  # align to stereo int16 frame boundary (4 bytes)
+            del self._audio_buf[:trim]
+        # Start the flush timer only after the pre-buffer has filled,
+        # so the sink's hardware buffer begins nearly full and never starves.
+        if not self._audio_timer.isActive() and self._audio_sink is not None:
+            if len(self._audio_buf) >= self._AUDIO_PREBUF:
+                self._audio_timer.start()
+                logger.info("Audio pre-buffer ready, playback started")
+
+    def _flush_audio(self):
+        """QTimer slot: write buffered PCM into the sink; pad with silence on underrun."""
+        if self._audio_io is None or self._audio_sink is None:
+            return
+        if self._audio_sink.state() == QAudio.State.StoppedState:
+            return
+        free = self._audio_sink.bytesFree()
+        if free <= 0:
+            return
+        if self._audio_buf:
+            n = min(free, len(self._audio_buf))
+            written = self._audio_io.write(bytes(self._audio_buf[:n]))
+            if written > 0:
+                del self._audio_buf[:written]
+        else:
+            # Keep sink in ActiveState with silence so resuming audio has no click
+            self._audio_io.write(bytes(min(free, self._AUDIO_SILENCE)))
+
+    def _on_camera_volume_changed(self, camera_id: str, volume: float):
+        """Update per-camera volume and apply to live sink if camera is active."""
+        session = self._camera_sessions.get(camera_id)
+        if session is None:
+            return
+        session.audio_volume = volume
+        # Keep both buttons in sync
+        session.video_widget.volume_btn.set_volume(volume)
+        session.matrix_tile.volume_btn.set_volume(volume)
+        if self._current_camera_id == camera_id and self._audio_sink is not None:
+            self._audio_sink.setVolume(volume)
+
     def _stop_audio(self):
         """Stop audio playback."""
-        if self._audio_player:
-            self._audio_player.stop()
-            self._audio_player.setSource(QUrl())
-            self._audio_player = None
-        if self._audio_output:
-            self._audio_output = None
-
-    def _on_mute_toggled(self, muted: bool):
-        if self._audio_output:
-            self._audio_output.setMuted(muted)
-
-    def _on_volume_changed(self, value: int):
-        if self._audio_output:
-            self._audio_output.setVolume(value / 100.0)
+        self._audio_timer.stop()
+        self._audio_buf = bytearray()
+        if self._audio_sink is not None:
+            self._audio_sink.stop()
+            self._audio_sink = None
+        self._audio_io = None
 
     # ---- PTZ Control ----
 

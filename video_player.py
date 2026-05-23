@@ -7,6 +7,7 @@ import logging
 import time
 from typing import Optional
 
+import numpy as np
 import av
 from av.audio.resampler import AudioResampler
 from PyQt6.QtCore import QThread, pyqtSignal, QMutex, Qt
@@ -52,9 +53,11 @@ AUDIO_OUTPUT_CHANNELS = 2
 
 
 class VideoStreamThread(QThread):
-    """Thread for capturing RTSP video stream frames via PyAV."""
+    """Thread for capturing RTSP video and audio streams via PyAV."""
 
     frame_ready = pyqtSignal(QImage)
+    audio_format_ready = pyqtSignal(int, int)
+    audio_chunk_ready = pyqtSignal(bytes)
     error_occurred = pyqtSignal(str)
     stream_started = pyqtSignal()
     stream_stopped = pyqtSignal()
@@ -109,16 +112,34 @@ class VideoStreamThread(QThread):
                 video_stream = container.streams.video[0]
                 video_stream.thread_type = 'SLICE'
 
+                audio_stream = None
+                resampler = None
+                demux_streams = [video_stream]
+                if getattr(container.streams, 'audio', None):
+                    audio_stream = container.streams.audio[0]
+                    demux_streams.append(audio_stream)
+                    resampler = AudioResampler(
+                        format='s16p',
+                        layout='stereo',
+                        rate=AUDIO_OUTPUT_SAMPLE_RATE,
+                    )
+
                 EMIT_INTERVAL = 1.0 / 30  # max ~30fps display rate
                 last_emit_time = 0.0
                 first_frame_received = False
                 opened_at = time.monotonic()
 
-                for packet in container.demux(video_stream):
+                if audio_stream:
+                    self.audio_format_ready.emit(
+                        AUDIO_OUTPUT_SAMPLE_RATE,
+                        AUDIO_OUTPUT_CHANNELS,
+                    )
+
+                for packet in container.demux(*demux_streams):
                     if not self._running:
                         break
 
-                    if not first_frame_received and time.monotonic() - opened_at > self._first_frame_timeout:
+                    if not first_frame_received and packet.stream == video_stream and time.monotonic() - opened_at > self._first_frame_timeout:
                         raise TimeoutError(
                             "No decodable video frame received within "
                             f"{self._first_frame_timeout:.0f}s using {profile_name.upper()} transport"
@@ -128,27 +149,62 @@ class VideoStreamThread(QThread):
                         if not self._running:
                             break
 
-                        if not first_frame_received:
-                            first_frame_received = True
-                            reconnect_attempts = 0
-                            self.stream_started.emit()
-                            logger.info("RTSP stream opened successfully")
+                        if packet.stream == video_stream:
+                            if not first_frame_received:
+                                first_frame_received = True
+                                reconnect_attempts = 0
+                                self.stream_started.emit()
+                                logger.info("RTSP stream opened successfully")
 
-                        now = time.monotonic()
-                        if now - last_emit_time < EMIT_INTERVAL:
-                            continue
+                            now = time.monotonic()
+                            if now - last_emit_time < EMIT_INTERVAL:
+                                continue
 
-                        rgb_frame = frame.reformat(format='rgb24')
-                        arr = rgb_frame.to_ndarray()
-                        h, w, ch = arr.shape
-                        bytes_per_line = ch * w
-                        qt_image = QImage(
-                            arr.data, w, h, bytes_per_line,
-                            QImage.Format.Format_RGB888,
-                        ).copy()
+                            rgb_frame = frame.reformat(format='rgb24')
+                            arr = rgb_frame.to_ndarray()
+                            h, w, ch = arr.shape
+                            bytes_per_line = ch * w
+                            qt_image = QImage(
+                                arr.data, w, h, bytes_per_line,
+                                QImage.Format.Format_RGB888,
+                            ).copy()
 
-                        self.frame_ready.emit(qt_image)
-                        last_emit_time = now
+                            self.frame_ready.emit(qt_image)
+                            last_emit_time = now
+                        elif packet.stream == audio_stream and resampler:
+                            for output_frame in resampler.resample(frame):
+                                if not self._running:
+                                    break
+                                planes = output_frame.planes
+                                if not planes:
+                                    continue
+                                # Read raw int16 samples directly from FFmpeg planes.
+                                # s16p mono (1 plane) or stereo (2 planes) are both
+                                # handled explicitly to avoid to_ndarray() shape surprises.
+                                ch0 = np.frombuffer(bytes(planes[0]), dtype=np.int16)
+                                if len(planes) >= 2:
+                                    ch1 = np.frombuffer(bytes(planes[1]), dtype=np.int16)
+                                    n = min(len(ch0), len(ch1))
+                                    interleaved = np.empty(n * 2, dtype=np.int16)
+                                    interleaved[0::2] = ch0[:n]
+                                    interleaved[1::2] = ch1[:n]
+                                else:
+                                    # Mono output: duplicate to both channels
+                                    interleaved = np.empty(len(ch0) * 2, dtype=np.int16)
+                                    interleaved[0::2] = ch0
+                                    interleaved[1::2] = ch0
+                                if not getattr(self, '_audio_fmt_logged', False):
+                                    self._audio_fmt_logged = True
+                                    logger.info(
+                                        f"Audio: fmt={output_frame.format.name} "
+                                        f"rate={output_frame.sample_rate} Hz "
+                                        f"planes={len(planes)} "
+                                        f"samples={output_frame.samples} "
+                                        f"→ {len(interleaved) * 2} B/chunk"
+                                    )
+                                pcm_bytes = interleaved.tobytes()
+                                if pcm_bytes:
+                                    self.audio_chunk_ready.emit(pcm_bytes)
 
                 if self._running and not first_frame_received:
                     raise RuntimeError(
@@ -214,7 +270,7 @@ class AudioStreamThread(QThread):
         self._running = True
         reconnect_attempts = 0
         resampler = AudioResampler(
-            format='s16',
+            format='s16p',
             layout='stereo',
             rate=AUDIO_OUTPUT_SAMPLE_RATE,
         )
@@ -259,8 +315,21 @@ class AudioStreamThread(QThread):
                         for output_frame in resampler.resample(frame):
                             if not self._running:
                                 break
-
-                            pcm_bytes = output_frame.to_ndarray().tobytes()
+                            planes = output_frame.planes
+                            if not planes:
+                                continue
+                            ch0 = np.frombuffer(bytes(planes[0]), dtype=np.int16)
+                            if len(planes) >= 2:
+                                ch1 = np.frombuffer(bytes(planes[1]), dtype=np.int16)
+                                n = min(len(ch0), len(ch1))
+                                interleaved = np.empty(n * 2, dtype=np.int16)
+                                interleaved[0::2] = ch0[:n]
+                                interleaved[1::2] = ch1[:n]
+                            else:
+                                interleaved = np.empty(len(ch0) * 2, dtype=np.int16)
+                                interleaved[0::2] = ch0
+                                interleaved[1::2] = ch0
+                            pcm_bytes = interleaved.tobytes()
                             if pcm_bytes:
                                 self.audio_chunk_ready.emit(pcm_bytes)
 

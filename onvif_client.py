@@ -5,6 +5,7 @@ Handles connection, PTZ control, media profiles, and camera services.
 
 import logging
 import os
+import inspect
 from typing import Any, Optional
 from dataclasses import dataclass, field
 
@@ -13,6 +14,44 @@ from zeep.exceptions import Fault
 from zeep.helpers import serialize_object
 
 logger = logging.getLogger(__name__)
+
+
+async def _resolve_maybe_awaitable(value):
+    """Handle both sync and async ONVIF library methods."""
+
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+class _OnvifAsyncCompatProxy:
+    """Expose sync-or-async ONVIF service methods behind a consistent awaitable API."""
+
+    _passthrough_methods = {
+        'create_type',
+        'get_type',
+        'get_element',
+        'type_factory',
+    }
+
+    def __init__(self, target):
+        self._target = target
+
+    def __getattr__(self, name: str):
+        attribute = getattr(self._target, name)
+        if not callable(attribute) or name in self._passthrough_methods:
+            return attribute
+
+        async def _call(*args, **kwargs):
+            return await _resolve_maybe_awaitable(attribute(*args, **kwargs))
+
+        return _call
+
+
+def _wrap_onvif_service(service):
+    if service is None or isinstance(service, _OnvifAsyncCompatProxy):
+        return service
+    return _OnvifAsyncCompatProxy(service)
 
 
 @dataclass
@@ -204,26 +243,36 @@ class ONVIFPTZClient:
                 self.camera_info.password,
                 wsdl_dir=wsdl_dir,
             )
-            await self._camera.update_xaddrs()
+            await _resolve_maybe_awaitable(self._camera.update_xaddrs())
 
             # Initialize services
-            self._device_service = await self._camera.create_devicemgmt_service()
-            self._media_service = await self._camera.create_media_service()
+            self._device_service = _wrap_onvif_service(
+                await _resolve_maybe_awaitable(self._camera.create_devicemgmt_service())
+            )
+            self._media_service = _wrap_onvif_service(
+                await _resolve_maybe_awaitable(self._camera.create_media_service())
+            )
 
             try:
-                self._ptz_service = await self._camera.create_ptz_service()
+                self._ptz_service = _wrap_onvif_service(
+                    await _resolve_maybe_awaitable(self._camera.create_ptz_service())
+                )
             except Exception as e:
                 self._ptz_service = None
                 logger.info(f"PTZ service unavailable: {e}")
 
             try:
-                self._imaging_service = await self._camera.create_imaging_service()
+                self._imaging_service = _wrap_onvif_service(
+                    await _resolve_maybe_awaitable(self._camera.create_imaging_service())
+                )
             except Exception as e:
                 self._imaging_service = None
                 logger.info(f"Imaging service unavailable: {e}")
 
             try:
-                self._analytics_service = await self._camera.create_analytics_service()
+                self._analytics_service = _wrap_onvif_service(
+                    await _resolve_maybe_awaitable(self._camera.create_analytics_service())
+                )
             except Exception as e:
                 self._analytics_service = None
                 logger.info(f"Analytics service unavailable: {e}")
@@ -259,7 +308,7 @@ class ONVIFPTZClient:
             logger.error(f"Failed to connect to camera: {e}")
             if self._camera is not None:
                 try:
-                    await self._camera.close()
+                    await _resolve_maybe_awaitable(self._camera.close())
                 except Exception as close_error:
                     logger.debug(f"Failed to close camera after connection error: {close_error}")
                 finally:
@@ -275,7 +324,7 @@ class ONVIFPTZClient:
         """Disconnect from the camera."""
         if self._camera is not None:
             try:
-                await self._camera.close()
+                await _resolve_maybe_awaitable(self._camera.close())
             except Exception as e:
                 logger.debug(f"Failed to close camera cleanly: {e}")
         self._camera = None
