@@ -254,11 +254,4 @@ python build_standalone.py
 - Network Settings
 - Maintenance
 - User Management
-- standalone build для Windows; build-пайплайн для Linux и macOS
-
-## 7. Направления развития
-
-- WS-Discovery через IPv6
-- автоматические интеграционные тесты для нескольких классов ONVIF-камер
-- вынести ONVIF-вызовы из GUI-потока в неблокирующую task-based модель
-- инсталляторы для Windows, AppImage для Linux, подписанный `.app` для macOS
+- standalone build для Windows, Linux и macOS
