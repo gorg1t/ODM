@@ -278,8 +278,9 @@ class VideoStreamThread(QThread):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._rtsp_url: Optional[str] = None
-        self._running   = False
-        self._mutex     = QMutex()
+        self._running        = False
+        self._stop_requested = False   # set by stop_stream() before run() starts
+        self._mutex          = QMutex()
         self._max_reconnect_attempts = 5
         self._first_frame_timeout    = 20.0
         self._volume: float = 0.0
@@ -304,18 +305,29 @@ class VideoStreamThread(QThread):
 
     def stop_stream(self):
         self._mutex.lock()
-        self._running = False
+        self._running        = False
+        self._stop_requested = True
         self._mutex.unlock()
         if self._stop_event is not None:
             self._stop_event.set()
-        self.wait(7000)
+        # Only block if the QThread is actually alive; avoids a 7-second hang
+        # when stop_stream() is called on a thread that never entered run().
+        if self.isRunning():
+            self.wait(7000)
 
     def run(self):
         if not self._rtsp_url:
             self.error_occurred.emit("No RTSP URL configured")
             return
 
+        # stop_stream() may have been called between thread.start() and here.
+        self._mutex.lock()
+        if self._stop_requested:
+            self._mutex.unlock()
+            self.stream_stopped.emit()
+            return
         self._running = True
+        self._mutex.unlock()
 
         stop_event = mp.Event()
         cmd_q      = mp.Queue()

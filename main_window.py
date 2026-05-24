@@ -76,6 +76,7 @@ class CameraSession:
     last_status: PTZStatus = field(default_factory=PTZStatus)
     audio_volume: float = 0.0
     onvif_lock: threading.Lock = field(default_factory=threading.Lock)
+    _start_seq: int = field(default=0, compare=False, repr=False)
 
 
 @dataclass
@@ -4425,8 +4426,7 @@ class MainWindow(QMainWindow):
 
     def _stop_video_for_session(self, session: CameraSession, clear_widget: bool = False):
         if session.video_thread:
-            if session.video_thread.is_running:
-                session.video_thread.stop_stream()
+            session.video_thread.stop_stream()
             session.video_thread = None
 
         if clear_widget:
@@ -4467,20 +4467,25 @@ class MainWindow(QMainWindow):
             widget.setPixmap(QPixmap())
             widget.setText("Connecting to video stream...")
 
-        camera_id  = session.camera_id
-        _background   = background
-        _start_audio  = start_audio
+        camera_id    = session.camera_id
+        _background  = background
+        _start_audio = start_audio
+
+        # Stamp this start attempt so that stale async callbacks from a previous
+        # (superseded) call to _start_video_for_session are silently discarded.
+        session._start_seq += 1
+        _my_seq = session._start_seq
 
         def _on_uri(rtsp_url):
             s = self._camera_sessions.get(camera_id)
-            if s is None:
+            if s is None or s._start_seq != _my_seq:
                 return
             self._finish_start_video(s, rtsp_url, _background, _start_audio)
 
         def _on_uri_err(msg):
             logger.error(f"Failed to get stream URI for {session.host}: {msg}")
             s = self._camera_sessions.get(camera_id)
-            if s is None:
+            if s is None or s._start_seq != _my_seq:
                 return
             s.current_stream_uri = None
             for widget in (s.video_widget, s.matrix_video_widget):
@@ -4517,6 +4522,11 @@ class MainWindow(QMainWindow):
             self._set_rtsp_status(rtsp_url)
             self.live_video_widget.set_stream_uri(rtsp_url)
         auth_url = self._inject_rtsp_credentials(rtsp_url, session.username, session.password)
+
+        # Guard: stop any thread that crept in via a concurrent code path.
+        if session.video_thread is not None:
+            session.video_thread.stop_stream()
+            session.video_thread = None
 
         session.video_thread = VideoStreamThread()
         session.video_thread.set_url(auth_url)
