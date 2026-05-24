@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -23,9 +24,8 @@ from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QFormLayout, QMenu, QCheckBox, QToolButton,
     QStyle, QFileDialog,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSlot, pyqtSignal, QSize, QStandardPaths, QEvent, QPoint, QMimeData, QIODevice
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSlot, pyqtSignal, QSize, QStandardPaths, QEvent, QPoint, QMimeData
 from PyQt6.QtGui import QImage, QPixmap, QIcon, QKeySequence, QShortcut, QAction, QColor, QDrag
-from PyQt6.QtMultimedia import QAudioSink, QAudioFormat, QAudio
 
 from camera_discovery import (
     DiscoveredCameraInfo,
@@ -75,6 +75,7 @@ class CameraSession:
     video_thread: Optional[VideoStreamThread] = None
     last_status: PTZStatus = field(default_factory=PTZStatus)
     audio_volume: float = 0.0
+    onvif_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 @dataclass
@@ -92,55 +93,135 @@ class SavedCameraConfig:
         return f"{self.host}:{self.port}:{self.username}"
 
 
-class VolumeButtonWidget(QWidget):
-    """Compact speaker button that shows a vertical slider popup on click."""
+class _CameraConnectWorker(QThread):
+    """Runs camera ONVIF connection + media profile fetch in a background thread."""
+
+    profiles_ready = pyqtSignal(object)   # list[MediaProfileInfo]
+    failed         = pyqtSignal(str)      # error message; empty str = generic failure
+
+    def __init__(self, client, loop: asyncio.AbstractEventLoop, parent=None):
+        super().__init__(parent)
+        self.setObjectName("CameraConnectWorker")
+        self._client = client
+        self._loop   = loop
+
+    def run(self):
+        try:
+            success = self._loop.run_until_complete(self._client.connect())
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+
+        if not success:
+            self.failed.emit("")          # empty → show generic "Connection Failed" dialog
+            return
+
+        try:
+            profiles = self._loop.run_until_complete(self._client.get_media_profiles())
+        except Exception as exc:
+            logger.error(f"Failed to load media profiles: {exc}")
+            profiles = []
+
+        self.profiles_ready.emit(profiles)
+
+
+class _OnvifWorker(QThread):
+    """Runs a single ONVIF coroutine on a session's asyncio loop in a background thread.
+
+    Uses the per-session lock to serialise concurrent callers — the asyncio event
+    loop cannot handle overlapping run_until_complete() calls.
+    """
+
+    result = pyqtSignal(object)
+    error  = pyqtSignal(str)
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        coro,
+        lock: threading.Lock,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setObjectName("OnvifWorker")
+        self._loop = loop
+        self._coro = coro
+        self._lock = lock
+
+    def run(self):
+        with self._lock:
+            try:
+                value = self._loop.run_until_complete(self._coro)
+                self.result.emit(value)
+            except Exception as exc:
+                self.error.emit(str(exc))
+
+
+class VolumeButtonWidget(QFrame):
+    """Horizontal volume control: speaker icon (click to mute) + horizontal slider."""
 
     volume_changed = pyqtSignal(float)
-    _BTN = 26
+
+    _BTN   = 26    # height / icon button size — kept so positioning code stays unchanged
+    _WIDTH = 150   # total widget width
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(self._BTN, self._BTN)
-        self._volume = 0.0
+        self.setFixedSize(self._WIDTH, self._BTN)
+        self._volume   = 0.0
+        self._pre_mute = 0.5
 
-        self._btn = QToolButton(self)
-        self._btn.setFixedSize(self._BTN, self._BTN)
-        self._btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._btn.setAutoRaise(True)
-        self._btn.setStyleSheet("""
-            QToolButton {
-                background-color: rgba(20,20,20,0.82);
-                border: 1px solid #444;
+        self.setStyleSheet("""
+            QFrame {
+                background-color: #1e1e1e;
+                border: 1px solid #3c3c3c;
                 border-radius: 4px;
+            }
+            QToolButton {
+                background: transparent;
+                border: none;
+                border-radius: 3px;
                 padding: 2px;
             }
-            QToolButton:hover { background-color: rgba(55,55,55,0.95); border-color: #3794ff; }
+            QToolButton:hover { background: rgba(80,80,80,160); }
+            QSlider::groove:horizontal {
+                background: #3c3c3c; height: 4px; border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                background: #3794ff;
+                width: 12px; height: 12px;
+                margin: -4px 0;
+                border-radius: 6px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #3794ff; border-radius: 2px;
+            }
         """)
-        self._btn.clicked.connect(self._toggle_popup)
 
-        self._popup = QFrame(None,
-            Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
-        self._popup.setFixedSize(32, 110)
-        self._popup.setStyleSheet("""
-            QFrame { background:#1e1e1e; border:1px solid #3c3c3c; border-radius:6px; }
-            QSlider::groove:vertical { background:#3c3c3c; width:4px; border-radius:2px; }
-            QSlider::handle:vertical { background:#3794ff; width:12px; height:12px;
-                                       margin:-4px; border-radius:6px; }
-            QSlider::sub-page:vertical { background:#3794ff; border-radius:2px; }
-        """)
-        pl = QVBoxLayout(self._popup)
-        pl.setContentsMargins(4, 6, 4, 6)
-        self._slider = QSlider(Qt.Orientation.Vertical)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 0, 6, 0)
+        layout.setSpacing(4)
+
+        self._btn = QToolButton()
+        self._btn.setFixedSize(22, 22)
+        self._btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn.setAutoRaise(True)
+        self._btn.clicked.connect(self._toggle_mute)
+        layout.addWidget(self._btn)
+
+        self._slider = QSlider(Qt.Orientation.Horizontal)
         self._slider.setRange(0, 100)
         self._slider.setValue(0)
         self._slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._slider.valueChanged.connect(self._on_slider)
-        pl.addWidget(self._slider)
+        layout.addWidget(self._slider, 1)
 
         self._update_icon()
 
     def set_volume(self, v: float):
         self._volume = max(0.0, min(1.0, v))
+        if self._volume > 0.0:
+            self._pre_mute = self._volume
         self._slider.blockSignals(True)
         self._slider.setValue(round(self._volume * 100))
         self._slider.blockSignals(False)
@@ -149,18 +230,24 @@ class VolumeButtonWidget(QWidget):
     def get_volume(self) -> float:
         return self._volume
 
-    def _toggle_popup(self):
-        if self._popup.isVisible():
-            self._popup.hide()
+    def _toggle_mute(self):
+        if self._volume > 0.0:
+            self._pre_mute = self._volume
+            self._volume = 0.0
+            self._slider.blockSignals(True)
+            self._slider.setValue(0)
+            self._slider.blockSignals(False)
+            self._update_icon()
+            self.volume_changed.emit(0.0)
         else:
-            pos = self._btn.mapToGlobal(QPoint(
-                (self._BTN - self._popup.width()) // 2, -self._popup.height() - 4
-            ))
-            self._popup.move(pos)
-            self._popup.show()
+            vol = self._pre_mute if self._pre_mute > 0.0 else 0.5
+            self.set_volume(vol)
+            self.volume_changed.emit(vol)
 
     def _on_slider(self, value: int):
         self._volume = value / 100.0
+        if self._volume > 0.0:
+            self._pre_mute = self._volume
         self._update_icon()
         self.volume_changed.emit(self._volume)
 
@@ -169,10 +256,6 @@ class VolumeButtonWidget(QWidget):
               if self._volume == 0.0
               else QStyle.StandardPixmap.SP_MediaVolume)
         self._btn.setIcon(self.style().standardIcon(sp))
-
-    def hideEvent(self, event):
-        self._popup.hide()
-        super().hideEvent(event)
 
 
 class VideoWidget(QLabel):
@@ -321,8 +404,9 @@ class CameraMatrixTile(QFrame):
         self.setFixedSize(width + 20, height + 62)
         # Position volume_btn at bottom-right of the video area
         # video_widget starts at x=10, y=52 (10 margin + 34 header + 8 spacing)
-        bsize = VolumeButtonWidget._BTN
-        self.volume_btn.move(10 + width - bsize - 6, 52 + height - bsize - 6)
+        bw = VolumeButtonWidget._WIDTH
+        bh = VolumeButtonWidget._BTN
+        self.volume_btn.move(10 + width - bw - 6, 52 + height - bh - 6)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -2856,6 +2940,8 @@ class MainWindow(QMainWindow):
         self._current_camera_id: Optional[str] = None
         self._matrix_camera_order: list[str] = []
         self._workspace_mode = WORKSPACE_MODE_SINGLE
+        self._onvif_tasks: set = set()          # keeps QThread references alive
+        self._pending_connections: set = set()  # camera_ids currently connecting
         self._saved_cameras: dict[str, SavedCameraConfig] = self._load_saved_camera_configs()
         self._add_camera_defaults = next(
             iter(self._saved_cameras.values()),
@@ -2867,15 +2953,6 @@ class MainWindow(QMainWindow):
             ),
         )
 
-        # Audio playback via QAudioSink (PCM from VideoStreamThread)
-        self._audio_sink: Optional[QAudioSink] = None
-        self._audio_io: Optional[QIODevice] = None
-        # Continuous PCM byte buffer; _flush_audio drains it into the sink.
-        # Using a bytearray avoids truncating chunks at chunk boundaries.
-        self._audio_buf: bytearray = bytearray()
-        self._audio_timer = QTimer()
-        self._audio_timer.setInterval(10)
-        self._audio_timer.timeout.connect(self._flush_audio)
 
         # Status polling timer
         self._status_timer = QTimer()
@@ -4150,7 +4227,6 @@ class MainWindow(QMainWindow):
             return
 
         if self._workspace_mode == WORKSPACE_MODE_MATRIX:
-            self._stop_audio()
             matrix_camera_ids = set(self._matrix_camera_order)
             for session in self._camera_sessions.values():
                 if session.camera_id not in matrix_camera_ids:
@@ -4290,6 +4366,43 @@ class MainWindow(QMainWindow):
         self._on_refresh_network_settings()
         self._on_refresh_user_accounts()
 
+    # ------------------------------------------------------------------
+    # Non-blocking ONVIF helper
+    # ------------------------------------------------------------------
+
+    def _run_onvif(
+        self,
+        session: "CameraSession",
+        coro,
+        on_done,
+        on_error=None,
+    ) -> None:
+        """Run *coro* on session.loop in a background thread.
+
+        *on_done(result)* and *on_error(msg)* are called back in the main
+        thread via Qt queued-connection signals.  Callbacks are silently
+        dropped if the session has already been removed.
+        """
+        camera_id = session.camera_id
+
+        def _safe_done(result):
+            if camera_id in self._camera_sessions:
+                on_done(result)
+
+        def _safe_error(msg):
+            if camera_id in self._camera_sessions:
+                if on_error is not None:
+                    on_error(msg)
+                else:
+                    logger.error(f"ONVIF error for {camera_id}: {msg}")
+
+        worker = _OnvifWorker(session.loop, coro, session.onvif_lock)
+        worker.result.connect(_safe_done)
+        worker.error.connect(_safe_error)
+        self._onvif_tasks.add(worker)
+        worker.finished.connect(lambda: self._onvif_tasks.discard(worker))
+        worker.start()
+
     def _inject_rtsp_credentials(self, rtsp_url: str, username: str, password: str) -> str:
         if username and password and "rtsp://" in rtsp_url and "@" not in rtsp_url:
             return rtsp_url.replace("rtsp://", f"rtsp://{username}:{password}@", 1)
@@ -4345,9 +4458,8 @@ class MainWindow(QMainWindow):
                 if session.current_stream_uri:
                     self._set_rtsp_status(session.current_stream_uri)
                     self.live_video_widget.set_stream_uri(session.current_stream_uri)
-                if start_audio and self._audio_sink is None and session.video_thread:
-                    session.video_thread.audio_chunk_ready.connect(self._on_audio_chunk_ready)
-                    self._on_audio_format_ready(AUDIO_OUTPUT_SAMPLE_RATE, AUDIO_OUTPUT_CHANNELS)
+                if start_audio and session.video_thread:
+                    session.video_thread.set_volume(session.audio_volume)
             return
 
         self._stop_video_for_session(session, clear_widget=False)
@@ -4355,14 +4467,42 @@ class MainWindow(QMainWindow):
             widget.setPixmap(QPixmap())
             widget.setText("Connecting to video stream...")
 
-        try:
-            rtsp_url = session.loop.run_until_complete(
-                session.client.get_stream_uri(session.active_stream_token)
-            )
-        except Exception as e:
-            logger.error(f"Failed to get stream URI for {session.host}: {e}")
-            rtsp_url = None
+        camera_id  = session.camera_id
+        _background   = background
+        _start_audio  = start_audio
 
+        def _on_uri(rtsp_url):
+            s = self._camera_sessions.get(camera_id)
+            if s is None:
+                return
+            self._finish_start_video(s, rtsp_url, _background, _start_audio)
+
+        def _on_uri_err(msg):
+            logger.error(f"Failed to get stream URI for {session.host}: {msg}")
+            s = self._camera_sessions.get(camera_id)
+            if s is None:
+                return
+            s.current_stream_uri = None
+            for widget in (s.video_widget, s.matrix_video_widget):
+                widget.setText("No video stream")
+            if not _background:
+                self._set_rtsp_status(None)
+                self.live_video_widget.set_stream_uri(None)
+
+        self._run_onvif(
+            session,
+            session.client.get_stream_uri(session.active_stream_token),
+            _on_uri, _on_uri_err,
+        )
+
+    def _finish_start_video(
+        self,
+        session: "CameraSession",
+        rtsp_url: Optional[str],
+        background: bool,
+        start_audio: bool,
+    ):
+        """Finish video thread setup after the RTSP URI has been obtained."""
         if not rtsp_url:
             session.current_stream_uri = None
             for widget in (session.video_widget, session.matrix_video_widget):
@@ -4392,8 +4532,7 @@ class MainWindow(QMainWindow):
             partial(self._on_stream_error, session.camera_id)
         )
         if not background and start_audio:
-            session.video_thread.audio_format_ready.connect(self._on_audio_format_ready)
-            session.video_thread.audio_chunk_ready.connect(self._on_audio_chunk_ready)
+            session.video_thread.set_volume(session.audio_volume)
         session.video_thread.start()
 
     def _on_refresh_stream_uri(self):
@@ -4402,17 +4541,20 @@ class MainWindow(QMainWindow):
             self.live_video_widget.set_session(None)
             return
 
-        try:
-            rtsp_url = session.loop.run_until_complete(
-                session.client.get_stream_uri(session.active_stream_token)
-            )
-        except Exception as e:
-            logger.error(f"Refresh stream URI error: {e}")
-            rtsp_url = None
+        def _done(rtsp_url):
+            session.current_stream_uri = rtsp_url
+            self.live_video_widget.set_stream_uri(rtsp_url)
+            self._set_rtsp_status(rtsp_url)
 
-        session.current_stream_uri = rtsp_url
-        self.live_video_widget.set_stream_uri(rtsp_url)
-        self._set_rtsp_status(rtsp_url)
+        def _err(msg):
+            logger.error(f"Refresh stream URI error: {msg}")
+            _done(None)
+
+        self._run_onvif(
+            session,
+            session.client.get_stream_uri(session.active_stream_token),
+            _done, _err,
+        )
 
     def _refresh_session_profiles(self, session: CameraSession):
         try:
@@ -4430,17 +4572,17 @@ class MainWindow(QMainWindow):
             self.video_streaming_widget.clear_state("No active camera")
             return
 
-        try:
-            encoder_settings = session.loop.run_until_complete(
-                session.client.get_video_encoder_settings()
-            )
-            self.video_streaming_widget.set_encoder_settings(encoder_settings)
-        except Exception as e:
-            logger.error(f"Refresh video streaming settings error: {e}")
+        def _done(result):
+            self.video_streaming_widget.set_encoder_settings(result)
+
+        def _err(msg):
+            logger.error(f"Refresh video streaming settings error: {msg}")
             self.video_streaming_widget.clear_state(
                 "Failed to load video streaming settings",
                 allow_refresh=True,
             )
+
+        self._run_onvif(session, session.client.get_video_encoder_settings(), _done, _err)
 
     def _on_apply_video_streaming(self, values: dict[str, Any]):
         session = self._active_session()
@@ -4475,15 +4617,17 @@ class MainWindow(QMainWindow):
             self.imaging_settings_widget.clear_state("No active camera")
             return
 
-        try:
-            payload = session.loop.run_until_complete(session.client.get_imaging_settings())
-            self.imaging_settings_widget.set_configuration(payload)
-        except Exception as e:
-            logger.error(f"Refresh imaging settings error: {e}")
+        def _done(result):
+            self.imaging_settings_widget.set_configuration(result)
+
+        def _err(msg):
+            logger.error(f"Refresh imaging settings error: {msg}")
             self.imaging_settings_widget.clear_state(
                 "Failed to load imaging settings",
                 allow_refresh=True,
             )
+
+        self._run_onvif(session, session.client.get_imaging_settings(), _done, _err)
 
     def _on_apply_imaging_settings(self, values: dict[str, Any]):
         session = self._active_session()
@@ -4511,17 +4655,17 @@ class MainWindow(QMainWindow):
             self.network_settings_widget.clear_state("No active camera")
             return
 
-        try:
-            payload = session.loop.run_until_complete(
-                session.client.get_network_settings()
-            )
-            self.network_settings_widget.set_payload(payload)
-        except Exception as e:
-            logger.error(f"Refresh network settings error: {e}")
+        def _done(result):
+            self.network_settings_widget.set_payload(result)
+
+        def _err(msg):
+            logger.error(f"Refresh network settings error: {msg}")
             self.network_settings_widget.clear_state(
                 "Failed to load network settings",
                 allow_refresh=True,
             )
+
+        self._run_onvif(session, session.client.get_network_settings(), _done, _err)
 
     def _on_apply_network_settings(self, values: dict[str, Any]):
         session = self._active_session()
@@ -4671,15 +4815,17 @@ class MainWindow(QMainWindow):
             self.user_management_widget.clear_state("No active camera")
             return
 
-        try:
-            users = session.loop.run_until_complete(session.client.get_user_accounts())
-            self.user_management_widget.set_users(users)
-        except Exception as e:
-            logger.error(f"Refresh user accounts error: {e}")
+        def _done(result):
+            self.user_management_widget.set_users(result)
+
+        def _err(msg):
+            logger.error(f"Refresh user accounts error: {msg}")
             self.user_management_widget.clear_state(
                 "Failed to load user accounts",
                 allow_refresh=True,
             )
+
+        self._run_onvif(session, session.client.get_user_accounts(), _done, _err)
 
     def _on_create_user_account(self):
         session = self._active_session()
@@ -4907,7 +5053,6 @@ class MainWindow(QMainWindow):
             fallback_page = self.camera_tabs.widget(fallback_index)
 
         if was_active:
-            self._stop_audio()
             self._current_camera_id = None
 
         self._stop_video_for_session(session, clear_widget=True)
@@ -5001,7 +5146,6 @@ class MainWindow(QMainWindow):
 
         previous_session = self._active_session()
         if previous_session is not None:
-            self._stop_audio()
             if self._workspace_mode == WORKSPACE_MODE_SINGLE:
                 self._stop_video_for_session(previous_session, clear_widget=False)
 
@@ -5288,55 +5432,65 @@ class MainWindow(QMainWindow):
             self._update_header_state(self._active_session())
             return existing_session
 
-        self.status_bar.showMessage(f"Connecting to {host}:{config.port}...", 2000)
-        QApplication.processEvents()
+        # Prevent duplicate in-flight connections to the same camera
+        if camera_id in self._pending_connections:
+            logger.info(f"Connection to {camera_id} already in progress, ignoring")
+            return None
+
+        self.status_bar.showMessage(f"Connecting to {host}:{config.port}...")
+        self._pending_connections.add(camera_id)
 
         client = ONVIFPTZClient(host, config.port, user, config.password)
-        loop = asyncio.new_event_loop()
+        loop   = asyncio.new_event_loop()
 
-        try:
-            success = loop.run_until_complete(client.connect())
-        except Exception as e:
-            logger.error(f"Connection error: {e}")
-            if show_error_dialogs:
-                QMessageBox.critical(self, "Connection Error", str(e))
-            loop.close()
-            active_session = self._active_session()
-            if active_session is not None:
-                self._refresh_active_camera_ui(active_session)
-            else:
-                self._show_empty_state()
-            return None
+        worker = _CameraConnectWorker(client, loop)
+        self._onvif_tasks.add(worker)
 
-        if not success:
-            loop.close()
-            if show_error_dialogs:
-                QMessageBox.warning(
-                    self,
-                    "Connection Failed",
-                    "Could not connect to camera. Check settings and try again.",
-                )
-            active_session = self._active_session()
-            if active_session is not None:
-                self._refresh_active_camera_ui(active_session)
-            else:
-                self._show_empty_state()
-            return None
+        def _on_done(profiles):
+            self._pending_connections.discard(camera_id)
+            self._onvif_tasks.discard(worker)
+            self._on_camera_connect_done(
+                client, loop,
+                host, config.port, user, config.password,
+                profiles, camera_id, normalized_config,
+                persist, activate_tab, open_in_matrix_only,
+            )
 
-        try:
-            stream_profiles = loop.run_until_complete(client.get_media_profiles())
-        except Exception as e:
-            logger.error(f"Failed to load media profiles: {e}")
-            stream_profiles = []
+        def _on_failed(error_msg: str):
+            self._pending_connections.discard(camera_id)
+            self._onvif_tasks.discard(worker)
+            self._on_camera_connect_failed(error_msg, loop, show_error_dialogs)
 
+        worker.profiles_ready.connect(_on_done)
+        worker.failed.connect(_on_failed)
+        worker.finished.connect(lambda: self._onvif_tasks.discard(worker))
+        worker.start()
+        return None   # session will be created asynchronously in _on_camera_connect_done
+
+    def _on_camera_connect_done(
+        self,
+        client,
+        loop: asyncio.AbstractEventLoop,
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        stream_profiles,
+        camera_id: str,
+        normalized_config: "SavedCameraConfig",
+        persist: bool,
+        activate_tab: bool,
+        open_in_matrix_only: bool,
+    ) -> None:
+        """Called in the main thread after a successful camera connection."""
         session = self._build_camera_session(
             camera_id=camera_id,
             client=client,
             loop=loop,
             host=host,
-            port=config.port,
-            username=user,
-            password=config.password,
+            port=port,
+            username=username,
+            password=password,
             stream_profiles=stream_profiles,
             preferred_stream_token=normalized_config.active_stream_token,
         )
@@ -5365,8 +5519,37 @@ class MainWindow(QMainWindow):
             self._refresh_saved_cameras_widget()
 
         self._apply_workspace_mode()
+        self.status_bar.showMessage(f"Connected to {host}:{port}", 3000)
 
-        return session
+    def _on_camera_connect_failed(
+        self,
+        error_msg: str,
+        loop: asyncio.AbstractEventLoop,
+        show_error_dialogs: bool,
+    ) -> None:
+        """Called in the main thread when camera connection fails."""
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+        self.status_bar.clearMessage()
+
+        if show_error_dialogs:
+            if error_msg:
+                QMessageBox.critical(self, "Connection Error", error_msg)
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Connection Failed",
+                    "Could not connect to camera. Check settings and try again.",
+                )
+
+        active_session = self._active_session()
+        if active_session is not None:
+            self._refresh_active_camera_ui(active_session)
+        else:
+            self._show_empty_state()
 
     # ---- Keyboard PTZ ----
 
@@ -5484,90 +5667,18 @@ class MainWindow(QMainWindow):
         if active_session is not None:
             self._remove_camera_session(active_session.camera_id, forget_saved=False)
 
-    def _on_audio_format_ready(self, sample_rate: int, channels: int):
-        """Create QAudioSink once VideoStreamThread reports the audio format."""
-        self._stop_audio()
-        try:
-            fmt = QAudioFormat()
-            fmt.setSampleRate(sample_rate)
-            fmt.setChannelCount(channels)
-            fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
-            self._audio_sink = QAudioSink(fmt)
-            # ~500 ms hardware buffer gives plenty of headroom against RTSP jitter.
-            # The timer does NOT start here — playback begins only after the
-            # pre-buffer fills (_on_audio_chunk_ready starts the timer).
-            self._audio_sink.setBufferSize(96000)
-            session = self._active_session()
-            initial_volume = session.audio_volume if session else 0.0
-            self._audio_sink.setVolume(initial_volume)
-            self._audio_io = self._audio_sink.start()
-            self._audio_buf = bytearray()
-            logger.info("Audio sink created, pre-buffering…")
-        except Exception as e:
-            logger.error(f"Audio playback error: {e}")
-
-    # ~170 ms at 48 kHz stereo s16 — wait for this much data before starting
-    _AUDIO_PREBUF = 32768
-    # Trim to this many bytes (~250 ms) when the in-memory buffer exceeds 1 s
-    _AUDIO_BUF_TRIM = 48000
-    _AUDIO_BUF_MAX = 192000  # ~1 s max before trimming
-    # Silence written per tick when _audio_buf is empty (~10 ms) to keep the
-    # sink in ActiveState and avoid the click that occurs on IdleState resume
-    _AUDIO_SILENCE = 1920
-
-    def _on_audio_chunk_ready(self, pcm_bytes: bytes):
-        """Append incoming PCM to the continuous byte buffer."""
-        self._audio_buf.extend(pcm_bytes)
-        if len(self._audio_buf) > self._AUDIO_BUF_MAX:
-            # Align discard position to an 8-byte stereo float32 frame boundary
-            trim = len(self._audio_buf) - self._AUDIO_BUF_TRIM
-            trim -= trim % 4  # align to stereo int16 frame boundary (4 bytes)
-            del self._audio_buf[:trim]
-        # Start the flush timer only after the pre-buffer has filled,
-        # so the sink's hardware buffer begins nearly full and never starves.
-        if not self._audio_timer.isActive() and self._audio_sink is not None:
-            if len(self._audio_buf) >= self._AUDIO_PREBUF:
-                self._audio_timer.start()
-                logger.info("Audio pre-buffer ready, playback started")
-
-    def _flush_audio(self):
-        """QTimer slot: write buffered PCM into the sink; pad with silence on underrun."""
-        if self._audio_io is None or self._audio_sink is None:
-            return
-        if self._audio_sink.state() == QAudio.State.StoppedState:
-            return
-        free = self._audio_sink.bytesFree()
-        if free <= 0:
-            return
-        if self._audio_buf:
-            n = min(free, len(self._audio_buf))
-            written = self._audio_io.write(bytes(self._audio_buf[:n]))
-            if written > 0:
-                del self._audio_buf[:written]
-        else:
-            # Keep sink in ActiveState with silence so resuming audio has no click
-            self._audio_io.write(bytes(min(free, self._AUDIO_SILENCE)))
-
     def _on_camera_volume_changed(self, camera_id: str, volume: float):
-        """Update per-camera volume and apply to live sink if camera is active."""
         session = self._camera_sessions.get(camera_id)
         if session is None:
+            logger.warning(f"Volume change ignored: no session for {camera_id}")
             return
         session.audio_volume = volume
-        # Keep both buttons in sync
         session.video_widget.volume_btn.set_volume(volume)
         session.matrix_tile.volume_btn.set_volume(volume)
-        if self._current_camera_id == camera_id and self._audio_sink is not None:
-            self._audio_sink.setVolume(volume)
-
-    def _stop_audio(self):
-        """Stop audio playback."""
-        self._audio_timer.stop()
-        self._audio_buf = bytearray()
-        if self._audio_sink is not None:
-            self._audio_sink.stop()
-            self._audio_sink = None
-        self._audio_io = None
+        if session.video_thread is not None:
+            session.video_thread.set_volume(volume)
+        else:
+            logger.warning(f"Volume change ignored: video thread not running for {camera_id}")
 
     # ---- PTZ Control ----
 
@@ -5624,11 +5735,13 @@ class MainWindow(QMainWindow):
             self.presets_widget.update_presets([])
             return
 
-        try:
-            presets = session.loop.run_until_complete(session.client.get_presets())
-            self.presets_widget.update_presets(presets)
-        except Exception as e:
-            logger.error(f"Refresh presets error: {e}")
+        def _done(result):
+            self.presets_widget.update_presets(result)
+
+        def _err(msg):
+            logger.error(f"Refresh presets error: {msg}")
+
+        self._run_onvif(session, session.client.get_presets(), _done, _err)
 
     def _on_save_preset(self):
         session = self._active_session()
@@ -5668,11 +5781,20 @@ class MainWindow(QMainWindow):
         if session is None:
             return
 
-        try:
-            status = session.loop.run_until_complete(session.client.get_status())
-            session.last_status = status
-        except Exception:
-            pass
+        camera_id = session.camera_id
+
+        def _done(status):
+            s = self._camera_sessions.get(camera_id)
+            if s is not None:
+                s.last_status = status
+
+        # Best-effort: if the lock is held by another ONVIF call, skip this poll tick
+        # rather than waiting and blocking the main thread.
+        if not session.onvif_lock.acquire(blocking=False):
+            return
+        session.onvif_lock.release()
+
+        self._run_onvif(session, session.client.get_status(), _done)
 
     # ---- Cleanup ----
 

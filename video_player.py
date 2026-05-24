@@ -1,17 +1,22 @@
 """
 RTSP Video Stream Player using PyAV (FFmpeg).
 Captures RTSP stream frames and provides them to the PyQt6 UI.
+
+FFmpeg decoding runs in a separate *process* (not just a thread) so that
+C-level crashes (e.g. access violations in a codec) cannot kill the main
+application.  The QThread acts as a supervisor: it spawns the worker
+process, forwards video frames to Qt via signals, and handles crashes
+gracefully.
 """
 
 import logging
+import multiprocessing as mp
 import time
 from typing import Optional
 
 import numpy as np
-import av
-from av.audio.resampler import AudioResampler
-from PyQt6.QtCore import QThread, pyqtSignal, QMutex, Qt
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtCore import QThread, pyqtSignal, QMutex
+from PyQt6.QtGui import QImage
 
 logger = logging.getLogger(__name__)
 
@@ -49,335 +54,388 @@ RTSP_OPTION_PROFILES = (
 )
 
 AUDIO_OUTPUT_SAMPLE_RATE = 48000
-AUDIO_OUTPUT_CHANNELS = 2
+AUDIO_OUTPUT_CHANNELS = 1
 
 
-class VideoStreamThread(QThread):
-    """Thread for capturing RTSP video and audio streams via PyAV."""
+# ---------------------------------------------------------------------------
+# Subprocess worker — must be a top-level function so Windows 'spawn' can
+# pickle it.  All FFmpeg / PyAV / sounddevice code lives here so that any
+# native crash is contained within this child process.
+# ---------------------------------------------------------------------------
 
-    frame_ready = pyqtSignal(QImage)
-    audio_format_ready = pyqtSignal(int, int)
-    audio_chunk_ready = pyqtSignal(bytes)
-    error_occurred = pyqtSignal(str)
-    stream_started = pyqtSignal()
-    stream_stopped = pyqtSignal()
+def _rtsp_subprocess_worker(
+    rtsp_url: str,
+    option_profiles: list,
+    max_reconnects: int,
+    first_frame_timeout: float,
+    stop_event,       # multiprocessing.Event
+    cmd_q,            # multiprocessing.Queue  — commands from main process
+    frame_q,          # multiprocessing.Queue  — frames/events to main process
+) -> None:
+    """Isolated FFmpeg/sounddevice worker.  Runs in a child process."""
+    import logging as _logging
+    import time as _time
+    import threading as _threading
+    import numpy as _np
+    import av as _av
+    from av.audio.resampler import AudioResampler as _Resampler
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._rtsp_url: Optional[str] = None
-        self._running = False
-        self._mutex = QMutex()
-        self._reconnect_delay = 3  # seconds
-        self._max_reconnect_attempts = 5
-        self._first_frame_timeout = 20.0
+    _log = _logging.getLogger(__name__)
 
-    def set_url(self, url: str):
-        """Set the RTSP stream URL."""
-        self._rtsp_url = url
+    # Windows WASAPI COM init (needed in every thread/process that uses audio)
+    try:
+        import ctypes
+        ctypes.windll.ole32.CoInitializeEx(None, 0)
+    except Exception:
+        pass
 
-    def stop_stream(self):
-        """Signal the thread to stop."""
-        self._mutex.lock()
-        self._running = False
-        self._mutex.unlock()
-        self.wait(5000)
+    import sounddevice as _sd
 
-    def run(self):
-        """Main thread loop: capture and emit frames."""
-        if not self._rtsp_url:
-            self.error_occurred.emit("No RTSP URL configured")
-            return
+    _AUDIO_RATE = 48000
+    _AUDIO_CH   = 1
+    _EMIT_INTERVAL = 1.0 / 30
 
-        self._running = True
-        reconnect_attempts = 0
+    current_vol = 0.0
+    reconnect_attempts = 0
 
-        while self._running and reconnect_attempts < self._max_reconnect_attempts:
-            container = None
-            try:
-                profile_name, profile_options = RTSP_OPTION_PROFILES[
-                    reconnect_attempts % len(RTSP_OPTION_PROFILES)
-                ]
-                logger.info(
-                    f"Opening RTSP stream: {self._rtsp_url} using {profile_name.upper()} transport"
+    def _drain_cmd_q():
+        """Apply any pending volume commands from the main process."""
+        nonlocal current_vol
+        try:
+            while True:
+                cmd = cmd_q.get_nowait()
+                if cmd[0] == 'vol':
+                    current_vol = float(cmd[1])
+        except Exception:
+            pass
+
+    # Drain initial commands (e.g. initial volume sent before process started)
+    _drain_cmd_q()
+
+    while not stop_event.is_set() and reconnect_attempts < max_reconnects:
+        container = None
+        audio_out  = None
+        try:
+            profile_name, profile_options = option_profiles[
+                reconnect_attempts % len(option_profiles)
+            ]
+            container = _av.open(
+                rtsp_url,
+                options=dict(profile_options),
+                timeout=(10.0, 10.0),
+            )
+            if not container.streams.video:
+                raise RuntimeError("No video stream found in RTSP source")
+
+            video_stream = container.streams.video[0]
+            # Use NONE threading to avoid internal FFmpeg race conditions
+            # that can cause access violations with certain camera codecs.
+            video_stream.thread_type = 'NONE'
+
+            audio_stream = None
+            resampler    = None
+            demux_streams = [video_stream]
+            if getattr(container.streams, 'audio', None):
+                audio_stream = container.streams.audio[0]
+                demux_streams.append(audio_stream)
+                resampler = _Resampler(
+                    format='fltp', layout='mono', rate=_AUDIO_RATE
                 )
 
-                container = av.open(
-                    self._rtsp_url,
-                    options=dict(profile_options),
-                    timeout=(10.0, 10.0),  # (open, read) timeouts in seconds
-                )
-                if not container.streams.video:
-                    raise RuntimeError("No video stream found in RTSP source")
+            # Watcher thread: closes the container as soon as stop_event fires
+            # so that container.demux() unblocks immediately instead of waiting
+            # for the next network packet or the stimeout to expire.
+            def _watcher(c):
+                stop_event.wait()
+                try:
+                    c.close()
+                except Exception:
+                    pass
 
-                video_stream = container.streams.video[0]
-                video_stream.thread_type = 'SLICE'
+            _threading.Thread(target=_watcher, args=(container,),
+                               daemon=True, name='rtsp-watcher').start()
 
-                audio_stream = None
-                resampler = None
-                demux_streams = [video_stream]
-                if getattr(container.streams, 'audio', None):
-                    audio_stream = container.streams.audio[0]
-                    demux_streams.append(audio_stream)
-                    resampler = AudioResampler(
-                        format='s16p',
-                        layout='stereo',
-                        rate=AUDIO_OUTPUT_SAMPLE_RATE,
-                    )
+            last_emit_time       = 0.0
+            first_frame_received = False
+            opened_at            = _time.monotonic()
 
-                EMIT_INTERVAL = 1.0 / 30  # max ~30fps display rate
-                last_emit_time = 0.0
-                first_frame_received = False
-                opened_at = time.monotonic()
-
-                if audio_stream:
-                    self.audio_format_ready.emit(
-                        AUDIO_OUTPUT_SAMPLE_RATE,
-                        AUDIO_OUTPUT_CHANNELS,
-                    )
-
-                for packet in container.demux(*demux_streams):
-                    if not self._running:
-                        break
-
-                    if not first_frame_received and packet.stream == video_stream and time.monotonic() - opened_at > self._first_frame_timeout:
-                        raise TimeoutError(
-                            "No decodable video frame received within "
-                            f"{self._first_frame_timeout:.0f}s using {profile_name.upper()} transport"
-                        )
-
-                    for frame in packet.decode():
-                        if not self._running:
-                            break
-
-                        if packet.stream == video_stream:
-                            if not first_frame_received:
-                                first_frame_received = True
-                                reconnect_attempts = 0
-                                self.stream_started.emit()
-                                logger.info("RTSP stream opened successfully")
-
-                            now = time.monotonic()
-                            if now - last_emit_time < EMIT_INTERVAL:
-                                continue
-
-                            rgb_frame = frame.reformat(format='rgb24')
-                            arr = rgb_frame.to_ndarray()
-                            h, w, ch = arr.shape
-                            bytes_per_line = ch * w
-                            qt_image = QImage(
-                                arr.data, w, h, bytes_per_line,
-                                QImage.Format.Format_RGB888,
-                            ).copy()
-
-                            self.frame_ready.emit(qt_image)
-                            last_emit_time = now
-                        elif packet.stream == audio_stream and resampler:
-                            for output_frame in resampler.resample(frame):
-                                if not self._running:
-                                    break
-                                planes = output_frame.planes
-                                if not planes:
-                                    continue
-                                # Read raw int16 samples directly from FFmpeg planes.
-                                # s16p mono (1 plane) or stereo (2 planes) are both
-                                # handled explicitly to avoid to_ndarray() shape surprises.
-                                ch0 = np.frombuffer(bytes(planes[0]), dtype=np.int16)
-                                if len(planes) >= 2:
-                                    ch1 = np.frombuffer(bytes(planes[1]), dtype=np.int16)
-                                    n = min(len(ch0), len(ch1))
-                                    interleaved = np.empty(n * 2, dtype=np.int16)
-                                    interleaved[0::2] = ch0[:n]
-                                    interleaved[1::2] = ch1[:n]
-                                else:
-                                    # Mono output: duplicate to both channels
-                                    interleaved = np.empty(len(ch0) * 2, dtype=np.int16)
-                                    interleaved[0::2] = ch0
-                                    interleaved[1::2] = ch0
-                                if not getattr(self, '_audio_fmt_logged', False):
-                                    self._audio_fmt_logged = True
-                                    logger.info(
-                                        f"Audio: fmt={output_frame.format.name} "
-                                        f"rate={output_frame.sample_rate} Hz "
-                                        f"planes={len(planes)} "
-                                        f"samples={output_frame.samples} "
-                                        f"→ {len(interleaved) * 2} B/chunk"
-                                    )
-                                pcm_bytes = interleaved.tobytes()
-                                if pcm_bytes:
-                                    self.audio_chunk_ready.emit(pcm_bytes)
-
-                if self._running and not first_frame_received:
-                    raise RuntimeError(
-                        f"RTSP stream opened using {profile_name.upper()} transport, but no video frames were decoded"
-                    )
-
-            except av.error.ExitError:
-                logger.info("Stream closed")
-                break
-            except Exception as e:
-                logger.error(f"Stream error: {e}")
-                self.error_occurred.emit(str(e))
-                reconnect_attempts += 1
-                if self._running:
-                    time.sleep(self._reconnect_delay)
-            finally:
-                if container is not None:
-                    container.close()
-
-        self._running = False
-        self.stream_stopped.emit()
-        logger.info("Video stream thread stopped")
-
-    @property
-    def is_running(self) -> bool:
-        return self._running
-
-
-class AudioStreamThread(QThread):
-    """Thread for decoding RTSP audio into PCM samples via PyAV."""
-
-    audio_format_ready = pyqtSignal(int, int)
-    audio_chunk_ready = pyqtSignal(bytes)
-    error_occurred = pyqtSignal(str)
-    stream_started = pyqtSignal()
-    stream_stopped = pyqtSignal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._rtsp_url: Optional[str] = None
-        self._running = False
-        self._mutex = QMutex()
-        self._reconnect_delay = 3
-        self._max_reconnect_attempts = 5
-
-    def set_url(self, url: str):
-        """Set the RTSP stream URL."""
-        self._rtsp_url = url
-
-    def stop_stream(self):
-        """Signal the thread to stop."""
-        self._mutex.lock()
-        self._running = False
-        self._mutex.unlock()
-        self.wait(5000)
-
-    def run(self):
-        """Decode RTSP audio and emit PCM audio chunks."""
-        if not self._rtsp_url:
-            self.error_occurred.emit("No RTSP URL configured")
-            return
-
-        self._running = True
-        reconnect_attempts = 0
-        resampler = AudioResampler(
-            format='s16p',
-            layout='stereo',
-            rate=AUDIO_OUTPUT_SAMPLE_RATE,
-        )
-
-        while self._running and reconnect_attempts < self._max_reconnect_attempts:
-            container = None
-            try:
-                logger.info(f"Opening RTSP audio stream: {self._rtsp_url}")
-
-                options = dict(DEFAULT_RTSP_OPTIONS)
-                options['rtsp_transport'] = 'tcp'
-
-                container = av.open(
-                    self._rtsp_url,
-                    options=options,
-                    timeout=(10.0, 5.0),
-                )
-
-                if not container.streams.audio:
-                    self.error_occurred.emit("No audio stream found")
-                    logger.warning("No audio stream found in RTSP source")
+            for packet in container.demux(*demux_streams):
+                if stop_event.is_set():
                     break
 
-                audio_stream = container.streams.audio[0]
+                if (not first_frame_received
+                        and packet.stream == video_stream
+                        and _time.monotonic() - opened_at > first_frame_timeout):
+                    raise TimeoutError(
+                        f"No video frame within {first_frame_timeout:.0f}s "
+                        f"using {profile_name.upper()} transport"
+                    )
 
-                reconnect_attempts = 0
-                self.audio_format_ready.emit(
-                    AUDIO_OUTPUT_SAMPLE_RATE,
-                    AUDIO_OUTPUT_CHANNELS,
-                )
-                self.stream_started.emit()
-                logger.info("RTSP audio stream opened successfully")
-
-                for packet in container.demux(audio_stream):
-                    if not self._running:
+                for frame in packet.decode():
+                    if stop_event.is_set():
                         break
 
-                    for frame in packet.decode():
-                        if not self._running:
-                            break
+                    if packet.stream == video_stream:
+                        if not first_frame_received:
+                            first_frame_received = True
+                            reconnect_attempts   = 0
+                            frame_q.put(('started',))
+                            _log.info("RTSP stream opened successfully")
 
-                        for output_frame in resampler.resample(frame):
-                            if not self._running:
+                        now = _time.monotonic()
+                        if now - last_emit_time < _EMIT_INTERVAL:
+                            continue
+
+                        rgb = frame.reformat(format='rgb24')
+                        arr = rgb.to_ndarray()          # (H, W, 3)  uint8
+                        h, w, ch = arr.shape
+                        try:
+                            frame_q.put_nowait(('frame', w, h, ch, arr.tobytes()))
+                        except Exception:
+                            pass   # drop frame when queue full (backpressure)
+                        last_emit_time = now
+
+                    elif packet.stream == audio_stream and resampler:
+                        # Apply any pending volume commands before writing audio
+                        _drain_cmd_q()
+
+                        for out_frame in resampler.resample(frame):
+                            if stop_event.is_set():
                                 break
-                            planes = output_frame.planes
-                            if not planes:
+                            pcm = out_frame.to_ndarray()   # (1, N) float32
+                            if pcm.ndim == 2:
+                                pcm = pcm.T                # (N, 1)
+                            if not pcm.size:
                                 continue
-                            ch0 = np.frombuffer(bytes(planes[0]), dtype=np.int16)
-                            if len(planes) >= 2:
-                                ch1 = np.frombuffer(bytes(planes[1]), dtype=np.int16)
-                                n = min(len(ch0), len(ch1))
-                                interleaved = np.empty(n * 2, dtype=np.int16)
-                                interleaved[0::2] = ch0[:n]
-                                interleaved[1::2] = ch1[:n]
-                            else:
-                                interleaved = np.empty(len(ch0) * 2, dtype=np.int16)
-                                interleaved[0::2] = ch0
-                                interleaved[1::2] = ch0
-                            pcm_bytes = interleaved.tobytes()
-                            if pcm_bytes:
-                                self.audio_chunk_ready.emit(pcm_bytes)
+                            try:
+                                if audio_out is None:
+                                    audio_out = _sd.OutputStream(
+                                        samplerate=_AUDIO_RATE,
+                                        channels=_AUDIO_CH,
+                                        dtype='float32',
+                                    )
+                                    audio_out.start()
+                                audio_out.write(pcm * _np.float32(current_vol))
+                            except Exception as sd_err:
+                                _log.warning(f"Audio output error: {sd_err}")
+                                if audio_out is not None:
+                                    try:
+                                        audio_out.stop()
+                                        audio_out.close()
+                                    except Exception:
+                                        pass
+                                    audio_out = None
 
-            except av.error.ExitError:
-                logger.info("Audio stream closed")
-                break
-            except Exception as e:
-                logger.error(f"Audio stream error: {e}")
-                self.error_occurred.emit(str(e))
-                reconnect_attempts += 1
-                if self._running:
-                    time.sleep(self._reconnect_delay)
-            finally:
-                if container is not None:
+            if not stop_event.is_set() and not first_frame_received:
+                raise RuntimeError(
+                    f"RTSP opened via {profile_name.upper()} but no frames decoded"
+                )
+
+        except _av.error.ExitError:
+            _log.info("Stream closed (ExitError)")
+            break
+        except Exception as exc:
+            if stop_event.is_set():
+                break   # intentional stop — do not reconnect
+            _log.error(f"Stream error: {exc}")
+            frame_q.put(('error', str(exc)))
+            reconnect_attempts += 1
+            # Interruptible sleep: exits immediately when stop_event is set
+            stop_event.wait(3.0)
+        finally:
+            if audio_out is not None:
+                try:
+                    audio_out.stop()
+                    audio_out.close()
+                except Exception:
+                    pass
+            if container is not None:
+                try:
                     container.close()
+                except Exception:
+                    pass
 
+    frame_q.put(('stopped',))
+
+
+# ---------------------------------------------------------------------------
+# Qt supervisor thread — spawns the worker process and forwards events to Qt
+# ---------------------------------------------------------------------------
+
+class VideoStreamThread(QThread):
+    """Supervisor QThread for the isolated RTSP worker process.
+
+    Video decoding runs inside a child process so that FFmpeg native crashes
+    (e.g. access violations with unusual camera codecs) cannot bring down the
+    main application.
+    """
+
+    frame_ready    = pyqtSignal(QImage)
+    error_occurred = pyqtSignal(str)
+    stream_started = pyqtSignal()
+    stream_stopped = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rtsp_url: Optional[str] = None
+        self._running   = False
+        self._mutex     = QMutex()
+        self._max_reconnect_attempts = 5
+        self._first_frame_timeout    = 20.0
+        self._volume: float = 0.0
+
+        # Shared state with the worker process; created fresh in run()
+        self._stop_event: Optional[mp.Event] = None
+        self._cmd_q:      Optional[mp.Queue] = None
+
+    def set_url(self, url: str):
+        self._rtsp_url = url
+
+    def set_volume(self, volume: float):
+        self._volume = max(0.0, min(1.0, float(volume)))
+        if self._cmd_q is not None:
+            try:
+                self._cmd_q.put_nowait(('vol', self._volume))
+                logger.debug(f"Volume command sent to subprocess: {self._volume:.2f}")
+            except Exception:
+                pass
+        else:
+            logger.debug(f"Volume stored (thread not running yet): {self._volume:.2f}")
+
+    def stop_stream(self):
+        self._mutex.lock()
         self._running = False
-        self.stream_stopped.emit()
-        logger.info("Audio stream thread stopped")
+        self._mutex.unlock()
+        if self._stop_event is not None:
+            self._stop_event.set()
+        self.wait(7000)
+
+    def run(self):
+        if not self._rtsp_url:
+            self.error_occurred.emit("No RTSP URL configured")
+            return
+
+        self._running = True
+
+        stop_event = mp.Event()
+        cmd_q      = mp.Queue()
+        frame_q    = mp.Queue(maxsize=4)   # small buffer keeps latency low
+
+        # Send the current volume before starting the process so the worker
+        # picks it up from cmd_q immediately on launch.
+        cmd_q.put(('vol', self._volume))
+
+        # Store for set_volume() / stop_stream() access from other threads
+        self._stop_event = stop_event
+        self._cmd_q      = cmd_q
+
+        # Serialise the option profiles as plain lists/dicts for pickling
+        option_profiles = [(name, dict(opts)) for name, opts in RTSP_OPTION_PROFILES]
+
+        process = mp.Process(
+            target=_rtsp_subprocess_worker,
+            args=(
+                self._rtsp_url,
+                option_profiles,
+                self._max_reconnect_attempts,
+                self._first_frame_timeout,
+                stop_event,
+                cmd_q,
+                frame_q,
+            ),
+            daemon=True,
+            name='rtsp-worker',
+        )
+        process.start()
+        logger.info(f"Started RTSP worker process PID={process.pid}")
+
+        try:
+            while self._running:
+                # Detect subprocess crash (segfault, access violation, …)
+                if not process.is_alive() and frame_q.empty():
+                    exit_code = process.exitcode
+                    logger.error(
+                        f"RTSP worker process died unexpectedly "
+                        f"(exit code {exit_code})"
+                    )
+                    self.error_occurred.emit(
+                        f"Video stream process crashed (exit code {exit_code})"
+                    )
+                    break
+
+                try:
+                    item = frame_q.get(timeout=0.05)
+                except Exception:
+                    continue   # queue empty — loop back
+
+                kind = item[0]
+
+                if kind == 'frame':
+                    _, w, h, ch, data = item
+                    qt_image = QImage(
+                        data, w, h, ch * w,
+                        QImage.Format.Format_RGB888,
+                    ).copy()
+                    self.frame_ready.emit(qt_image)
+
+                elif kind == 'started':
+                    self.stream_started.emit()
+
+                elif kind == 'error':
+                    logger.error(f"Stream error from worker: {item[1]}")
+                    self.error_occurred.emit(item[1])
+
+                elif kind == 'stopped':
+                    break
+
+        finally:
+            self._running = False
+            stop_event.set()
+            process.join(timeout=5)
+            if process.is_alive():
+                logger.warning("RTSP worker did not stop cleanly; terminating")
+                process.terminate()
+                process.join(timeout=2)
+
+            self._stop_event = None
+            self._cmd_q      = None
+            self.stream_stopped.emit()
+            logger.info("Video stream thread stopped")
 
     @property
     def is_running(self) -> bool:
         return self._running
 
 
-def build_rtsp_url(host: str, port: int = 554, path: str = "",
-                   username: str = "", password: str = "") -> str:
-    """
-    Build an RTSP URL with optional authentication.
-    
-    Args:
-        host: Camera IP address
-        port: RTSP port (default 554)
-        path: Stream path
-        username: Authentication username
-        password: Authentication password
-        
-    Returns:
-        Complete RTSP URL string
-    """
-    auth = ""
-    if username and password:
-        auth = f"{username}:{password}@"
-    
-    url = f"rtsp://{auth}{host}:{port}"
-    if path:
-        if not path.startswith("/"):
-            path = "/" + path
-        url += path
-    
-    return url
+# ---------------------------------------------------------------------------
+# Legacy audio-only thread (not used — kept for reference)
+# ---------------------------------------------------------------------------
+
+class AudioStreamThread(QThread):
+    """Unused — audio is handled inside _rtsp_subprocess_worker."""
+
+    error_occurred = pyqtSignal(str)
+    stream_started = pyqtSignal()
+    stream_stopped = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rtsp_url: Optional[str] = None
+        self._running = False
+        self._mutex   = QMutex()
+        self._volume: float = 0.0
+
+    def set_url(self, url: str):
+        self._rtsp_url = url
+
+    def set_volume(self, volume: float):
+        self._volume = max(0.0, min(1.0, volume))
+
+    def stop_stream(self):
+        self._mutex.lock()
+        self._running = False
+        self._mutex.unlock()
+        self.wait(5000)
+
+    def run(self):
+        pass
