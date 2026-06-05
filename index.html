@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ONVIF PTZ Controller - Профессиональное управление IP-камерами</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <nav class="navbar">
+        <div class="container">
+            <div class="nav-brand">
+                <svg class="logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                    <path d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/>
+                </svg>
+                <span>ONVIF PTZ Controller</span>
+            </div>
+            <ul class="nav-menu">
+                <li><a href="#product">Продукт</a></li>
+                <li><a href="#features">Возможности</a></li>
+                <li><a href="#audience">Аудитория</a></li>
+                <li><a href="#cases">Кейсы</a></li>
+                <li><a href="#download">Скачать</a></li>
+            </ul>
+        </div>
+    </nav>
+
+    <section class="hero">
+        <div class="container">
+            <div class="hero-content">
+                <h1>Профессиональное управление IP-камерами</h1>
+                <p class="hero-subtitle">Кроссплатформенное desktop-приложение для контроля PTZ-камер через протокол ONVIF с минимальной задержкой видео</p>
+                <div class="hero-buttons">
+                    <a href="#download" class="btn btn-primary">Скачать для Windows</a>
+                    <a href="#features" class="btn btn-secondary">Узнать больше</a>
+                </div>
+                <div class="hero-stats">
+                    <div class="stat">
+                        <div class="stat-value">100+</div>
+                        <div class="stat-label">Поддерживаемых камер</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-value">&lt;300ms</div>
+                        <div class="stat-label">Задержка видео</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-value">3</div>
+                        <div class="stat-label">Платформы</div>
+                    </div>
+                </div>
+            </div>
+            <div class="hero-visual">
+                <div class="app-window">
+                    <div class="window-header">
+                        <div class="window-controls">
+                            <span></span><span></span><span></span>
+                        </div>
+                        <div class="window-title">ONVIF PTZ Controller</div>
+                    </div>
+                    <div class="window-content">
+                        <div class="demo-grid">
+                            <div class="demo-video">
+                                <div class="video-placeholder">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                                        <circle cx="12" cy="12" r="10"/>
+                                        <polygon points="10 8 16 12 10 16 10 8"/>
+                                    </svg>
+                                </div>
+                            </div>
+                            <div class="demo-controls">
+                                <div class="control-btn">↑</div>
+                                <div class="control-btn">↓</div>
+                                <div class="control-btn">←</div>
+                                <div class="control-btn">→</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="product" class="section">
+        <div class="container">
+            <h2 class="section-title">О продукте</h2>
+            <div class="product-intro">
+                <p class="lead">ONVIF PTZ Controller — это профессиональное desktop-приложение для управления IP-камерами стандарта ONVIF. Приложение разработано для систем видеонаблюдения, где критична скорость реакции и точность управления.</p>
+            </div>
+            <div class="features-grid">
+                <div class="feature-card">
+                    <div class="feature-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                            <path d="M13 10V3L4 14h7v7l9-11h-7z"/>
+                        </svg>
+                    </div>
+                    <h3>Минимальная задержка</h3>
+                    <p>Прямой захват RTSP-потока через FFmpeg без промежуточных буферов. Задержка менее 300ms.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                            <rect x="2" y="7" width="20" height="14" rx="2"/>
+                            <path d="M16 3h-8v4h8V3z"/>
+                        </svg>
+                    </div>
+                    <h3>Множественный просмотр</h3>
+                    <p>Matrix mode для одновременного мониторинга до 16 камер на одном экране.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                            <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+                            <path d="M2 17l10 5 10-5M2 12l10 5 10-5"/>
+                        </svg>
+                    </div>
+                    <h3>Полный контроль</h3>
+                    <p>PTZ-управление, пресеты, настройка изображения, сетевых параметров и пользователей камеры.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                            <circle cx="12" cy="12" r="3"/>
+                            <path d="M12 1v6m0 6v6M1 12h6m6 0h6"/>
+                        </svg>
+                    </div>
+                    <h3>Автообнаружение</h3>
+                    <p>WS-Discovery для автоматического поиска ONVIF-камер в локальной сети.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="features" class="section section-dark">
+        <div class="container">
+            <h2 class="section-title">Ключевые возможности</h2>
+            <div class="features-detailed">
+                <div class="feature-detailed">
+                    <div class="feature-detailed-content">
+                        <h3>PTZ-управление</h3>
+                        <ul>
+                            <li><strong>Continuous mode</strong> — непрерывное движение при удержании кнопки</li>
+                            <li><strong>Relative mode</strong> — смещение на заданный шаг</li>
+                            <li><strong>Absolute mode</strong> — перемещение в точные координаты</li>
+                            <li>Регулируемая скорость движения и зум</li>
+                            <li>Горячие клавиши (WASD, стрелки, +/-)</li>
+                        </ul>
+                    </div>
+                    <div class="feature-detailed-visual">
+                        <div class="ptz-demo">
+                            <div class="ptz-grid">
+                                <button class="ptz-btn">↖</button>
+                                <button class="ptz-btn">↑</button>
+                                <button class="ptz-btn">↗</button>
+                                <button class="ptz-btn">←</button>
+                                <button class="ptz-btn stop">⏹</button>
+                                <button class="ptz-btn">→</button>
+                                <button class="ptz-btn">↙</button>
+                                <button class="ptz-btn">↓</button>
+                                <button class="ptz-btn">↘</button>
+                            </div>
+                            <div class="ptz-zoom">
+                                <button class="ptz-btn">🔍+</button>
+                                <button class="ptz-btn">🔍−</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="feature-detailed reverse">
+                    <div class="feature-detailed-content">
+                        <h3>Управление камерой</h3>
+                        <ul>
+                            <li><strong>Пресеты</strong> — сохранение и быстрый переход к позициям</li>
+                            <li><strong>Video Streaming</strong> — настройка разрешения, bitrate, framerate</li>
+                            <li><strong>Imaging Settings</strong> — яркость, контраст, резкость, ИК-фильтр</li>
+                            <li><strong>Network Settings</strong> — IP, DNS, NTP, порты</li>
+                            <li><strong>User Management</strong> — управление пользователями и правами</li>
+                        </ul>
+                    </div>
+                    <div class="feature-detailed-visual">
+                        <div class="settings-demo">
+                            <div class="setting-row">
+                                <span>Resolution</span>
+                                <select><option>1920x1080</option></select>
+                            </div>
+                            <div class="setting-row">
+                                <span>Bitrate</span>
+                                <input type="range" min="0" max="100" value="70">
+                            </div>
+                            <div class="setting-row">
+                                <span>FPS</span>
+                                <select><option>30</option></select>
+                            </div>
+                            <div class="setting-row">
+                                <span>Brightness</span>
+                                <input type="range" min="0" max="100" value="50">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="feature-detailed">
+                    <div class="feature-detailed-content">
+                        <h3>Работа с несколькими камерами</h3>
+                        <ul>
+                            <li><strong>Browser-style вкладки</strong> — каждая камера в отдельной вкладке</li>
+                            <li><strong>Matrix mode</strong> — одновременный просмотр до 16 камер</li>
+                            <li><strong>Drag-and-drop</strong> — переупорядочивание вкладок и плиток</li>
+                            <li><strong>Saved Cameras</strong> — локальная библиотека с избранными камерами</li>
+                            <li>Быстрое переключение между камерами через Ctrl+1...9</li>
+                        </ul>
+                    </div>
+                    <div class="feature-detailed-visual">
+                        <div class="matrix-demo">
+                            <div class="matrix-grid">
+                                <div class="matrix-cell active"></div>
+                                <div class="matrix-cell"></div>
+                                <div class="matrix-cell"></div>
+                                <div class="matrix-cell"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="audience" class="section">
+        <div class="container">
+            <h2 class="section-title">Целевая аудитория</h2>
+            <div class="audience-grid">
+                <div class="audience-card">
+                    <div class="audience-icon">🏢</div>
+                    <h3>Системные интеграторы</h3>
+                    <p>Компании, занимающиеся установкой и настройкой систем видеонаблюдения. Приложение упрощает конфигурацию PTZ-камер на объектах.</p>
+                </div>
+                <div class="audience-card">
+                    <div class="audience-icon">🎬</div>
+                    <h3>Видеопродакшн</h3>
+                    <p>Студии и операторы, использующие PTZ-камеры для трансляций, конференций и записи. Точное управление и минимальная задержка критичны для live-съемки.</p>
+                </div>
+                <div class="audience-card">
+                    <div class="audience-icon">🏭</div>
+                    <h3>Промышленные объекты</h3>
+                    <p>Предприятия с территориально распределенной инфраструктурой. Операторы мониторят несколько зон одновременно через Matrix mode.</p>
+                </div>
+                <div class="audience-card">
+                    <div class="audience-icon">🏛️</div>
+                    <h3>Охранные структуры</h3>
+                    <p>Пульты охраны, диспетчерские службы. Быстрое реагирование на инциденты через сохраненные пресеты и горячие клавиши.</p>
+                </div>
+                <div class="audience-card">
+                    <div class="audience-icon">🎓</div>
+                    <h3>Образовательные учреждения</h3>
+                    <p>Университеты и школы с лекционными залами, оборудованными PTZ-камерами для дистанционного обучения и записи лекций.</p>
+                </div>
+                <div class="audience-card">
+                    <div class="audience-icon">🏥</div>
+                    <h3>Медицинские учреждения</h3>
+                    <p>Больницы и клиники для мониторинга палат, операционных и общественных зон. Соответствие стандарту ONVIF обеспечивает совместимость.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="cases" class="section section-dark">
+        <div class="container">
+            <h2 class="section-title">Кейсы применения</h2>
+            <div class="cases">
+                <div class="case">
+                    <div class="case-header">
+                        <h3>Конференц-центр «Технопарк»</h3>
+                        <span class="case-tag">Видеопродакшн</span>
+                    </div>
+                    <div class="case-body">
+                        <div class="case-challenge">
+                            <h4>Задача</h4>
+                            <p>Оператору нужно управлять 8 PTZ-камерами во время live-трансляций конференций. VMS не давала достаточно точного контроля, а задержка видео 2-3 секунды приводила к ошибкам кадрирования.</p>
+                        </div>
+                        <div class="case-solution">
+                            <h4>Решение</h4>
+                            <p>ONVIF PTZ Controller с Matrix mode на втором мониторе. Оператор видит все 8 камер одновременно, переключается горячими клавишами Ctrl+1...8, использует сохраненные пресеты для типовых ракурсов.</p>
+                        </div>
+                        <div class="case-result">
+                            <h4>Результат</h4>
+                            <ul>
+                                <li>Задержка видео снижена с 2-3 сек до 250ms</li>
+                                <li>Время настройки камеры перед конференцией сократилось с 30 до 5 минут через сохраненные пресеты</li>
+                                <li>Ошибки кадрирования устранены благодаря точному Relative mode</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="case">
+                    <div class="case-header">
+                        <h3>Логистический терминал «ЕвроТранс»</h3>
+                        <span class="case-tag">Промышленность</span>
+                    </div>
+                    <div class="case-body">
+                        <div class="case-challenge">
+                            <h4>Задача</h4>
+                            <p>На территории склада площадью 12 га установлено 24 PTZ-камеры разных производителей. Существующее ПО не поддерживало часть камер, для других требовались отдельные клиенты.</p>
+                        </div>
+                        <div class="case-solution">
+                            <h4>Решение</h4>
+                            <p>Миграция на ONVIF PTZ Controller. Автообнаружение нашло все 24 камеры за 8 секунд, сохранённые камеры организованы по зонам. Диспетчер переключается между зонами через вкладки.</p>
+                        </div>
+                        <div class="case-result">
+                            <h4>Результат</h4>
+                            <ul>
+                                <li>Все камеры работают через единый интерфейс независимо от производителя</li>
+                                <li>Среднее время реакции на инцидент сокращено с 45 до 12 секунд</li>
+                                <li>Отказались от 3 разных клиентов в пользу одного приложения</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="case">
+                    <div class="case-header">
+                        <h3>Интегратор «СистемыБезопасности»</h3>
+                        <span class="case-tag">Системная интеграция</span>
+                    </div>
+                    <div class="case-body">
+                        <div class="case-challenge">
+                            <h4>Задача</h4>
+                            <p>Компания устанавливает системы видеонаблюдения на объектах заказчиков. Инженерам требовалось тестировать и настраивать камеры на месте, но веб-интерфейсы камер часто глючили или были недоступны.</p>
+                        </div>
+                        <div class="case-solution">
+                            <h4>Решение</h4>
+                            <p>ONVIF PTZ Controller на служебных ноутбуках инженеров. Приложение не требует установки (standalone build), работает через ONVIF без доступа к веб-интерфейсу. Network Settings позволяют настроить IP прямо из приложения.</p>
+                        </div>
+                        <div class="case-result">
+                            <h4>Результат</h4>
+                            <ul>
+                                <li>Время настройки одной камеры сократилось с 15 до 4 минут</li>
+                                <li>Количество повторных выездов по причине неправильной конфигурации снизилось на 68%</li>
+                                <li>Инженеры могут настраивать камеры через VPN без физического присутствия</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="case">
+                    <div class="case-header">
+                        <h3>Университет МИЭМ НИУ ВШЭ</h3>
+                        <span class="case-tag">Образование</span>
+                    </div>
+                    <div class="case-body">
+                        <div class="case-challenge">
+                            <h4>Задача</h4>
+                            <p>В 12 лекционных залах установлены PTZ-камеры для записи лекций. Преподаватели должны самостоятельно управлять камерой через планшет, но заводское приложение было сложным и медленным.</p>
+                        </div>
+                        <div class="case-solution">
+                            <h4>Решение</h4>
+                            <p>Развертывание ONVIF PTZ Controller на планшетах Surface. Для каждого зала созданы 3 пресета: «доска», «преподаватель», «аудитория». Преподавателю достаточно одного клика для переключения ракурса.</p>
+                        </div>
+                        <div class="case-result">
+                            <h4>Результат</h4>
+                            <ul>
+                                <li>95% преподавателей освоили управление камерой за первую лекцию (было 30%)</li>
+                                <li>Количество технических вызовов снизилось с 8-10 в неделю до 1-2</li>
+                                <li>Качество записей улучшилось за счет динамической смены ракурсов</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="section tech-specs">
+        <div class="container">
+            <h2 class="section-title">Технические характеристики</h2>
+            <div class="specs-grid">
+                <div class="spec-card">
+                    <h3>Протоколы</h3>
+                    <ul>
+                        <li>ONVIF Profile S</li>
+                        <li>RTSP (UDP/TCP)</li>
+                        <li>WS-Discovery</li>
+                    </ul>
+                </div>
+                <div class="spec-card">
+                    <h3>Видео</h3>
+                    <ul>
+                        <li>H.264, H.265</li>
+                        <li>MJPEG</li>
+                        <li>Задержка &lt;300ms</li>
+                    </ul>
+                </div>
+                <div class="spec-card">
+                    <h3>Аудио</h3>
+                    <ul>
+                        <li>AAC, G.711</li>
+                        <li>Регулировка громкости</li>
+                        <li>Mute/Unmute</li>
+                    </ul>
+                </div>
+                <div class="spec-card">
+                    <h3>Платформы</h3>
+                    <ul>
+                        <li>Windows 10/11</li>
+                        <li>Linux</li>
+                        <li>macOS</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="download" class="section section-dark">
+        <div class="container">
+            <h2 class="section-title">Скачать</h2>
+            <div id="releases-loading" class="releases-loading">
+                <div class="spinner"></div>
+                <p>Загрузка релизов...</p>
+            </div>
+            <div id="releases-error" class="releases-error" style="display: none;">
+                <p>Не удалось загрузить релизы. Попробуйте позже.</p>
+                <a href="https://github.com/yourusername/onvif-ptz-controller/releases" class="btn btn-primary" target="_blank">Открыть на GitHub</a>
+            </div>
+            <div id="releases-container" class="download-grid" style="display: none;">
+                <!-- Releases will be loaded here dynamically -->
+            </div>
+            <div class="download-note">
+                <p><strong>Standalone версия</strong> — не требует установки Python и зависимостей. Распакуйте архив и запустите исполняемый файл.</p>
+                <p>Исходный код доступен на <a href="https://github.com/yourusername/onvif-ptz-controller" class="link" target="_blank">GitHub</a></p>
+            </div>
+        </div>
+    </section>
+
+    <footer class="footer">
+        <div class="container">
+            <div class="footer-content">
+                <div class="footer-brand">
+                    <svg class="logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                        <path d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/>
+                    </svg>
+                    <span>ONVIF PTZ Controller</span>
+                </div>
+                <div class="footer-links">
+                    <a href="https://github.com">GitHub</a>
+                    <a href="#download">Документация</a>
+                    <a href="#audience">Поддержка</a>
+                </div>
+            </div>
+            <div class="footer-bottom">
+                <p>&copy; 2026 MIEM. Все права защищены.</p>
+            </div>
+        </div>
+    </footer>
+
+    <script src="script.js"></script>
+</body>
+</html>

@@ -1,6 +1,0 @@
-onvif-zeep-async>=1.2.0
-zeep>=4.2.1
-PyQt6>=6.5.0
-av>=12.0.0
-numpy>=1.24.0
-sounddevice
