@@ -34,27 +34,68 @@ async function loadReleases() {
 
         const release = await response.json();
 
-        // Group assets by platform
+        // Group assets by platform with more specific detection
         const platforms = {
-            windows: release.assets.find(a => a.name.toLowerCase().includes('windows') || a.name.endsWith('.zip')),
-            linux: release.assets.find(a => a.name.toLowerCase().includes('linux') || a.name.endsWith('.tar.gz')),
-            macos: release.assets.find(a => a.name.toLowerCase().includes('macos') || a.name.toLowerCase().includes('darwin') || a.name.endsWith('.dmg'))
+            'windows-amd64': release.assets.find(a =>
+                (a.name.toLowerCase().includes('windows') && a.name.toLowerCase().includes('amd64')) ||
+                (a.name.toLowerCase().includes('windows') && a.name.toLowerCase().includes('x64'))
+            ),
+            'linux-ubuntu-amd64': release.assets.find(a =>
+                a.name.toLowerCase().includes('ubuntu') && a.name.toLowerCase().includes('amd64')
+            ),
+            'linux-arch-amd64': release.assets.find(a =>
+                a.name.toLowerCase().includes('arch') && a.name.toLowerCase().includes('amd64')
+            ),
+            'macos-arm64': release.assets.find(a =>
+                (a.name.toLowerCase().includes('macos') || a.name.toLowerCase().includes('darwin')) &&
+                (a.name.toLowerCase().includes('arm64') || a.name.toLowerCase().includes('apple'))
+            ),
+            'macos-amd64': release.assets.find(a =>
+                (a.name.toLowerCase().includes('macos') || a.name.toLowerCase().includes('darwin')) &&
+                a.name.toLowerCase().includes('amd64')
+            )
         };
+
+        // Fallback: if specific variants not found, try generic
+        if (!platforms['windows-amd64']) {
+            platforms['windows-amd64'] = release.assets.find(a =>
+                a.name.toLowerCase().includes('windows') || a.name.endsWith('.zip')
+            );
+        }
+        if (!platforms['linux-ubuntu-amd64'] && !platforms['linux-arch-amd64']) {
+            const linuxAsset = release.assets.find(a =>
+                a.name.toLowerCase().includes('linux') || a.name.endsWith('.tar.gz')
+            );
+            platforms['linux-ubuntu-amd64'] = linuxAsset;
+        }
+        if (!platforms['macos-arm64'] && !platforms['macos-amd64']) {
+            const macAsset = release.assets.find(a =>
+                a.name.toLowerCase().includes('macos') || a.name.toLowerCase().includes('darwin') || a.name.endsWith('.dmg')
+            );
+            platforms['macos-arm64'] = macAsset;
+        }
 
         // Create download cards
         containerEl.innerHTML = '';
 
-        if (platforms.windows) {
-            containerEl.appendChild(createDownloadCard('Windows', 'Windows 10/11 (x64)', platforms.windows, 'windows'));
-        }
+        const platformConfigs = [
+            { key: 'windows-amd64', title: 'Windows', desc: 'Windows 10/11 (AMD64)', icon: 'windows' },
+            { key: 'linux-ubuntu-amd64', title: 'Linux Ubuntu', desc: 'Ubuntu 20.04+ (AMD64)', icon: 'linux' },
+            { key: 'linux-arch-amd64', title: 'Linux Arch', desc: 'Arch Linux (AMD64)', icon: 'linux' },
+            { key: 'macos-arm64', title: 'macOS', desc: 'macOS 11+ (Apple Silicon M1/M2)', icon: 'macos' },
+            { key: 'macos-amd64', title: 'macOS', desc: 'macOS 11+ (Intel)', icon: 'macos' }
+        ];
 
-        if (platforms.linux) {
-            containerEl.appendChild(createDownloadCard('Linux', 'Ubuntu 20.04+ / Fedora 34+', platforms.linux, 'linux'));
-        }
-
-        if (platforms.macos) {
-            containerEl.appendChild(createDownloadCard('macOS', 'macOS 11+ (Intel/Apple Silicon)', platforms.macos, 'macos'));
-        }
+        platformConfigs.forEach(config => {
+            if (platforms[config.key]) {
+                containerEl.appendChild(createDownloadCard(
+                    config.title,
+                    config.desc,
+                    platforms[config.key],
+                    config.icon
+                ));
+            }
+        });
 
         // Show container, hide loading
         loadingEl.style.display = 'none';
@@ -158,6 +199,122 @@ document.querySelectorAll('.feature-card, .audience-card, .case, .spec-card, .do
     el.style.transform = 'translateY(30px)';
     el.style.transition = 'opacity 0.6s ease-out, transform 0.6s ease-out';
     observer.observe(el);
+});
+
+// PTZ Interactive Demo
+let cameraX = 0;
+let cameraY = 0;
+let cameraZoom = 1.0;
+let ptzInterval = null;
+
+function initPTZDemo() {
+    const cameraContent = document.getElementById('camera-content');
+    const zoomLevelEl = document.getElementById('zoom-level');
+    const ptzButtons = document.querySelectorAll('.ptz-btn[data-action]');
+
+    if (!cameraContent || !zoomLevelEl) return;
+
+    function updateCamera() {
+        // Clamp values
+        cameraX = Math.max(-100, Math.min(100, cameraX));
+        cameraY = Math.max(-80, Math.min(80, cameraY));
+        cameraZoom = Math.max(0.5, Math.min(3.0, cameraZoom));
+
+        // Apply transform
+        cameraContent.setAttribute('transform',
+            `translate(${200 - cameraX}, ${150 - cameraY}) scale(${cameraZoom})`
+        );
+
+        // Update zoom indicator
+        zoomLevelEl.textContent = cameraZoom.toFixed(1) + 'x';
+    }
+
+    function startPTZAction(action) {
+        stopPTZAction(); // Stop any existing action
+
+        const speed = 2;
+
+        ptzInterval = setInterval(() => {
+            switch(action) {
+                case 'up':
+                    cameraY -= speed;
+                    break;
+                case 'down':
+                    cameraY += speed;
+                    break;
+                case 'left':
+                    cameraX -= speed;
+                    break;
+                case 'right':
+                    cameraX += speed;
+                    break;
+                case 'up-left':
+                    cameraY -= speed;
+                    cameraX -= speed;
+                    break;
+                case 'up-right':
+                    cameraY -= speed;
+                    cameraX += speed;
+                    break;
+                case 'down-left':
+                    cameraY += speed;
+                    cameraX -= speed;
+                    break;
+                case 'down-right':
+                    cameraY += speed;
+                    cameraX += speed;
+                    break;
+                case 'zoom-in':
+                    cameraZoom += 0.05;
+                    break;
+                case 'zoom-out':
+                    cameraZoom -= 0.05;
+                    break;
+                case 'stop':
+                    stopPTZAction();
+                    return;
+            }
+            updateCamera();
+        }, 50);
+    }
+
+    function stopPTZAction() {
+        if (ptzInterval) {
+            clearInterval(ptzInterval);
+            ptzInterval = null;
+        }
+    }
+
+    // Attach event listeners to PTZ buttons
+    ptzButtons.forEach(btn => {
+        const action = btn.getAttribute('data-action');
+
+        btn.addEventListener('mousedown', () => {
+            startPTZAction(action);
+        });
+
+        btn.addEventListener('mouseup', stopPTZAction);
+        btn.addEventListener('mouseleave', stopPTZAction);
+
+        // Touch support
+        btn.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            startPTZAction(action);
+        });
+
+        btn.addEventListener('touchend', (e) => {
+            e.preventDefault();
+            stopPTZAction();
+        });
+    });
+
+    // Initialize camera position
+    updateCamera();
+}
+
+// Initialize PTZ demo when DOM is loaded
+document.addEventListener('DOMContentLoaded', () => {
+    initPTZDemo();
 });
 
 // PTZ button interactions
