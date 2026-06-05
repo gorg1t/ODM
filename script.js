@@ -1,5 +1,5 @@
 // Configuration - Replace with your GitHub repository
-const GITHUB_REPO = 'yourusername/onvif-ptz-controller'; // Change this to your repo
+const GITHUB_REPO = 'gorg1t/ODM'; // Your actual repository
 
 // Platform detection helpers
 const platformIcons = {
