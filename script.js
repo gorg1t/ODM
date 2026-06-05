@@ -82,7 +82,7 @@ async function loadReleases() {
             { key: 'windows-amd64', title: 'Windows', desc: 'Windows 10/11 (AMD64)', icon: 'windows' },
             { key: 'linux-ubuntu-amd64', title: 'Linux Ubuntu', desc: 'Ubuntu 20.04+ (AMD64)', icon: 'linux' },
             { key: 'linux-arch-amd64', title: 'Linux Arch', desc: 'Arch Linux (AMD64)', icon: 'linux' },
-            { key: 'macos-arm64', title: 'macOS', desc: 'macOS 11+ (Apple Silicon M1/M2)', icon: 'macos' },
+            { key: 'macos-arm64', title: 'macOS', desc: 'macOS 11+ (Apple Silicon M1 – M5)', icon: 'macos' },
             { key: 'macos-amd64', title: 'macOS', desc: 'macOS 11+ (Intel)', icon: 'macos' }
         ];
 
@@ -205,12 +205,19 @@ document.querySelectorAll('.feature-card, .audience-card, .case, .spec-card, .do
 let cameraX = 0;
 let cameraY = 0;
 let cameraZoom = 1.0;
+let cameraBrightness = 1.0;
+let cameraContrast = 1.0;
 let ptzInterval = null;
+let isMatrixMode = false;
 
 function initPTZDemo() {
     const cameraContent = document.getElementById('camera-content');
     const zoomLevelEl = document.getElementById('zoom-level');
     const ptzButtons = document.querySelectorAll('.ptz-btn[data-action]');
+    const presetButtons = document.querySelectorAll('.preset-btn[data-preset]');
+    const brightnessSlider = document.getElementById('brightness');
+    const contrastSlider = document.getElementById('contrast');
+    const matrixToggle = document.getElementById('matrix-toggle');
 
     if (!cameraContent || !zoomLevelEl) return;
 
@@ -224,6 +231,10 @@ function initPTZDemo() {
         cameraContent.setAttribute('transform',
             `translate(${200 - cameraX}, ${150 - cameraY}) scale(${cameraZoom})`
         );
+
+        // Apply brightness and contrast filters
+        const filterValue = `brightness(${cameraBrightness}) contrast(${cameraContrast})`;
+        cameraContent.style.filter = filterValue;
 
         // Update zoom indicator
         zoomLevelEl.textContent = cameraZoom.toFixed(1) + 'x';
@@ -307,6 +318,107 @@ function initPTZDemo() {
             stopPTZAction();
         });
     });
+
+    // Preset buttons
+    if (presetButtons.length > 0) {
+        presetButtons.forEach(btn => {
+            btn.addEventListener('click', () => {
+                const preset = btn.getAttribute('data-preset');
+
+                // Animate to preset position
+                switch(preset) {
+                    case 'building':
+                        animateToPosition(-60, -30, 1.8);
+                        break;
+                    case 'car':
+                        animateToPosition(-10, 40, 2.2);
+                        break;
+                    case 'person':
+                        animateToPosition(60, -10, 2.5);
+                        break;
+                }
+            });
+        });
+    }
+
+    function animateToPosition(targetX, targetY, targetZoom) {
+        const steps = 30;
+        const deltaX = (targetX - cameraX) / steps;
+        const deltaY = (targetY - cameraY) / steps;
+        const deltaZoom = (targetZoom - cameraZoom) / steps;
+
+        let step = 0;
+        const animation = setInterval(() => {
+            if (step >= steps) {
+                clearInterval(animation);
+                return;
+            }
+
+            cameraX += deltaX;
+            cameraY += deltaY;
+            cameraZoom += deltaZoom;
+            updateCamera();
+            step++;
+        }, 20);
+    }
+
+    // Brightness slider
+    if (brightnessSlider) {
+        brightnessSlider.addEventListener('input', (e) => {
+            cameraBrightness = 0.5 + (e.target.value / 100);
+            updateCamera();
+        });
+    }
+
+    // Contrast slider
+    if (contrastSlider) {
+        contrastSlider.addEventListener('input', (e) => {
+            cameraContrast = 0.5 + (e.target.value / 100);
+            updateCamera();
+        });
+    }
+
+    // Matrix mode toggle
+    if (matrixToggle) {
+        matrixToggle.addEventListener('click', () => {
+            isMatrixMode = !isMatrixMode;
+            const cameraView = document.querySelector('.unified-camera-view');
+
+            if (isMatrixMode) {
+                cameraView.classList.add('matrix-mode');
+                matrixToggle.textContent = '📹 Одиночный режим';
+                createMatrixView();
+            } else {
+                cameraView.classList.remove('matrix-mode');
+                matrixToggle.innerHTML = '<span>📺</span> Переключить режим';
+            }
+        });
+    }
+
+    function createMatrixView() {
+        const cameraView = document.querySelector('.unified-camera-view');
+        let matrixContainer = cameraView.querySelector('.matrix-grid-view');
+
+        if (!matrixContainer) {
+            matrixContainer = document.createElement('div');
+            matrixContainer.className = 'matrix-grid-view';
+
+            for (let i = 0; i < 4; i++) {
+                const cell = document.createElement('div');
+                cell.className = 'matrix-cell-view';
+                if (i === 0) cell.classList.add('active');
+
+                // Clone the camera scene for each cell
+                const sceneSvg = document.querySelector('.camera-scene').cloneNode(true);
+                sceneSvg.style.display = 'block';
+                cell.appendChild(sceneSvg);
+
+                matrixContainer.appendChild(cell);
+            }
+
+            cameraView.querySelector('.camera-image-container').appendChild(matrixContainer);
+        }
+    }
 
     // Initialize camera position
     updateCamera();
