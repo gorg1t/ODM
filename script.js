@@ -486,7 +486,7 @@ const animateStats = () => {
             const prefix = text.replace(/\d+.*/, '');
             const suffix = text.replace(/.*\d+/, '');
             let current = 0;
-            const increment = target / 50;
+            const increment = target / 30;
             const timer = setInterval(() => {
                 current += increment;
                 if (current >= target) {
@@ -590,12 +590,12 @@ window.addEventListener('scroll', () => {
     const heroContent = document.querySelector('.hero-content');
     const heroVisual = document.querySelector('.hero-visual');
 
-    if (heroContent && scrolled < 800) {
+    if (heroContent && scrolled < 600) {
         heroContent.style.transform = `translateY(${scrolled * 0.3}px)`;
-        heroContent.style.opacity = 1 - scrolled / 800;
+        heroContent.style.opacity = 1 - scrolled / 600;
     }
 
-    if (heroVisual && scrolled < 800) {
+    if (heroVisual && scrolled < 600) {
         heroVisual.style.transform = `translateY(${scrolled * 0.2}px)`;
     }
 });
